@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  gateway:
+    build: ./gateway
+    container_name: vllm_gateway
+    ports:
+      - "9000:9000"
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+      - VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.85}
+      - DOCKER_HOST=unix:///var/run/docker.sock
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    restart: unless-stopped
