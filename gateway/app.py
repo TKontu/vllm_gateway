@@ -22,6 +22,8 @@ VLLM_PORT = 8000
 VLLM_CONTAINER_NAME = "vllm_server"
 VLLM_IMAGE = "vllm/vllm-openai:latest"
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.85")
+VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16") # Default to 16 GiB
+VLLM_MAX_MODEL_LEN = os.getenv("VLLM_MAX_MODEL_LEN", "0") # Default to 0 (vLLM default)
 # The base name of the shared network, as defined in the compose file.
 DOCKER_NETWORK_NAME = os.getenv("DOCKER_NETWORK_NAME", "vllm_network")
 # The gateway's own container name, used for self-inspection to find the real network name.
@@ -162,13 +164,21 @@ async def start_model(model_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to stop existing model container: {e}")
 
     try:
-        logging.info(f"Starting new container with model: {model_id} on network {RESOLVED_DOCKER_NETWORK}")
+        # Dynamically build the command for the vLLM container.
+        command = [
+            "--model", model_id,
+            "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION
+        ]
+        if int(VLLM_SWAP_SPACE) > 0:
+            command.extend(["--swap-space", VLLM_SWAP_SPACE])
+        if int(VLLM_MAX_MODEL_LEN) > 0:
+            command.extend(["--max-model-len", VLLM_MAX_MODEL_LEN])
+
+        logging.info(f"Starting new container with command: {' '.join(command)}")
+        
         new_container = docker_client.containers.run(
             VLLM_IMAGE,
-            command=[
-                "--model", model_id,
-                "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION
-            ],
+            command=command,
             name=VLLM_CONTAINER_NAME,
             hostname=VLLM_CONTAINER_NAME,
             detach=True,
