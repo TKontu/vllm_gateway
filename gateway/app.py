@@ -23,7 +23,7 @@ VLLM_CONTAINER_NAME = "vllm_server"
 VLLM_IMAGE = "vllm/vllm-openai:latest"
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.85")
 VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16") # Default to 16 GiB
-VLLM_MAX_MODEL_LEN = os.getenv("VLLM_MAX_MODEL_LEN", "0") # Default to 0 (vLLM default)
+VLLM_MAX_MODEL_LEN_GLOBAL = int(os.getenv("VLLM_MAX_MODEL_LEN_GLOBAL", "0")) # Optional: A global cap.
 # The base name of the shared network, as defined in the compose file.
 DOCKER_NETWORK_NAME = os.getenv("DOCKER_NETWORK_NAME", "vllm_network")
 # The gateway's own container name, used for self-inspection to find the real network name.
@@ -145,9 +145,36 @@ def get_current_model_id():
     except NotFound:
         return None
 
+async def get_model_max_len(model_id: str) -> int:
+    """Fetches the model's config.json from Hugging Face to find its max length."""
+    config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(config_url, follow_redirects=True)
+            response.raise_for_status()
+            config = response.json()
+            
+            # Common keys for max model length
+            keys_to_check = ['max_position_embeddings', 'n_positions', 'model_max_length']
+            for key in keys_to_check:
+                if key in config and isinstance(config[key], int):
+                    model_max_len = config[key]
+                    logging.info(f"Found '{key}' in config for {model_id}: {model_max_len}")
+                    return model_max_len
+            
+            logging.warning(f"Could not find a max length key in config.json for {model_id}.")
+            return 0 # Return 0 if no key is found
+    except httpx.HTTPStatusError as e:
+        logging.error(f"Failed to fetch config for {model_id}. Status code: {e.response.status_code}")
+        return 0
+    except Exception as e:
+        logging.error(f"An error occurred while getting max length for {model_id}: {e}")
+        return 0
+
 async def start_model(model_id: str):
     """
-    Stops the current vLLM container (if any) and starts a new one on the shared network.
+    Stops the current vLLM container (if any) and starts a new one with a
+    dynamically determined max_model_len.
     """
     logging.info(f"Attempting to switch model to: {model_id}")
 
@@ -164,6 +191,19 @@ async def start_model(model_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to stop existing model container: {e}")
 
     try:
+        # Dynamically determine the max_model_len for the new model
+        model_max_len = await get_model_max_len(model_id)
+        
+        # Use the smaller of the model's max length and the global cap (if set)
+        final_max_len = model_max_len
+        if VLLM_MAX_MODEL_LEN_GLOBAL > 0:
+            if model_max_len > 0:
+                final_max_len = min(model_max_len, VLLM_MAX_MODEL_LEN_GLOBAL)
+                logging.info(f"Using smaller of model max ({model_max_len}) and global max ({VLLM_MAX_MODEL_LEN_GLOBAL}): {final_max_len}")
+            else:
+                final_max_len = VLLM_MAX_MODEL_LEN_GLOBAL
+                logging.info(f"Model max length not found, using global max: {final_max_len}")
+
         # Dynamically build the command for the vLLM container.
         command = [
             "--model", model_id,
@@ -171,8 +211,8 @@ async def start_model(model_id: str):
         ]
         if int(VLLM_SWAP_SPACE) > 0:
             command.extend(["--swap-space", VLLM_SWAP_SPACE])
-        if int(VLLM_MAX_MODEL_LEN) > 0:
-            command.extend(["--max-model-len", VLLM_MAX_MODEL_LEN])
+        if final_max_len > 0:
+            command.extend(["--max-model-len", str(final_max_len)])
 
         logging.info(f"Starting new container with command: {' '.join(command)}")
         
@@ -215,8 +255,10 @@ async def start_model(model_id: str):
 
 # --- API Endpoints ---
 
-@app.post("/v1/chat/completions")
-async def chat_completions(request: Request):
+async def proxy_request(request: Request, target_path: str):
+    """
+    A generic proxy handler that manages model switching and forwards requests.
+    """
     global last_request_time
     body = await request.json()
     model_name = body.get("model")
@@ -233,11 +275,11 @@ async def chat_completions(request: Request):
             await start_model(target_model_id)
 
     try:
-        # Before forwarding, we must replace the user-friendly model name
+        # Before forwarding, replace the user-friendly model name
         # with the actual model ID that the vLLM server was started with.
         body['model'] = target_model_id
         
-        vllm_url = f"http://{VLLM_HOST}:{VLLM_PORT}/v1/chat/completions"
+        vllm_url = f"http://{VLLM_HOST}:{VLLM_PORT}{target_path}"
         response = await http_client.post(vllm_url, json=body, timeout=300)
         response.raise_for_status()
         return JSONResponse(content=response.json(), status_code=response.status_code)
@@ -245,6 +287,14 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "Error from vLLM service", "details": str(e)}, status_code=e.response.status_code)
     except httpx.RequestError as e:
         raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
+
+@app.post("/v1/chat/completions")
+async def chat_completions(request: Request):
+    return await proxy_request(request, "/v1/chat/completions")
+
+@app.post("/v1/embeddings")
+async def embeddings(request: Request):
+    return await proxy_request(request, "/v1/embeddings")
 
 @app.get("/v1/models")
 def list_models():
