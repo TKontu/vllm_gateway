@@ -4,6 +4,9 @@ This project provides a smart gateway that acts as a dynamic proxy for the [vLLM
 
 When an API request for a specific model is received, the gateway automatically handles the backend logistics: if the requested model isn't already loaded, it will gracefully stop the current vLLM container and launch a new one with the correct model, all without any manual intervention.
 
+> [!WARNING] > **Security Notice**
+> This gateway requires direct access to the host's Docker socket (`/var/run/docker.sock`). This is equivalent to granting root access to the host system. Please be fully aware of the security implications before deploying this project. It is strongly recommended to run this in a trusted and isolated environment.
+
 ## How It Works
 
 The architecture consists of a single, persistent `gateway` container that has access to the host's Docker socket.
@@ -18,11 +21,11 @@ This entire process is transparent to the end-user, who simply experiences a sli
 
 ## Key Features
 
--   **Dynamic Model Switching:** Automatically manages and swaps vLLM containers based on incoming API requests.
--   **Efficient Resource Management:** Only one resource-intensive vLLM model occupies GPU VRAM at any given time.
--   **Standard OpenAI API:** Uses the familiar `/v1/chat/completions` endpoint, making it a drop-in replacement for many applications.
--   **Concurrent Request Safety:** Uses an `asyncio.Lock` to ensure that simultaneous requests for different models are handled safely and queud, preventing race conditions.
--   **Highly Configurable:** Control allowed models, GPU memory utilization, and networking via environment variables.
+- **Dynamic Model Switching:** Automatically manages and swaps vLLM containers based on incoming API requests.
+- **Efficient Resource Management:** Only one resource-intensive vLLM model occupies GPU VRAM at any given time.
+- **Standard OpenAI API:** Uses the familiar `/v1/chat/completions` endpoint, making it a drop-in replacement for many applications.
+- **Concurrent Request Safety:** Uses an `asyncio.Lock` to ensure that simultaneous requests for different models are handled safely and queud, preventing race conditions.
+- **Highly Configurable:** Control allowed models, GPU memory utilization, and networking via environment variables.
 
 ## Deployment (Portainer / Docker Compose)
 
@@ -42,11 +45,12 @@ services:
     image: my-vlmm-gateway:latest
     container_name: vllm_gateway
     ports:
-      - "9000:9000" # Expose the gateway on port 9000
+      - "9003:9000" # Expose the gateway on port 9003
     environment:
       # --- REQUIRED ---
-      # Your Hugging Face token for accessing gated models
-      HUGGING_FACE_HUB_TOKEN: "hf_..."
+      # Your Hugging Face token for accessing gated models.
+      # You can also set this in your environment.
+      HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
 
       # --- NETWORKING ---
       # The network to attach the vLLM container to. Must match the network defined above.
@@ -57,16 +61,20 @@ services:
       # --- CONFIGURATION ---
       # A JSON string defining the user-friendly names and their corresponding Hugging Face model IDs.
       ALLOWED_MODELS_JSON: '{"gemma3-4B":"google/gemma-3-4b-it", "qwen2.5":"Qwen/Qwen2.5-Coder-7B-Instruct"}'
-      
+
       # The percentage of GPU memory vLLM should be allowed to use (e.g., "0.85" for 85%).
-      VLLM_GPU_MEMORY_UTILIZATION: "0.85"
+      # You can also set this in your environment.
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.85}
 
     volumes:
-      # Mount the Docker socket to allow the gateway to manage containers
+      # [SECURITY WARNING] Mount the Docker socket to allow the gateway to manage containers.
+      # This grants the container root-level access to the host.
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount the Hugging Face cache to avoid re-downloading models
       - /root/.cache/huggingface:/root/.cache/huggingface
-    
+      # Mount for the VRAM utilzation needs
+      - ./memory_footprints.json:/app/memory_footprints.json
+
     # Attach the gateway to the shared network
     networks:
       - vllm_network
@@ -85,6 +93,8 @@ docker build -t my-vlmm-gateway:latest .
 
 Once the gateway is running, you can send requests to it as you would to the OpenAI API. The `model` parameter should be one of the keys you defined in the `ALLOWED_MODELS_JSON` environment variable.
 
+> **Note on Model Loading:** The first time you request a new model, there will be a delay of a few minutes as the gateway downloads the model and starts the container. Subsequent requests to the same model will be much faster.
+
 **Example using PowerShell:**
 
 ```powershell
@@ -95,22 +105,22 @@ $headers = @{
 $body = @{
     model    = "gemma3-4B" # This must match a key in ALLOWED_MODELS_JSON
     messages = @(
-        @{ 
+        @{
             role    = "user"
             content = "What are the top 3 benefits of using Docker?"
         }
     )
 } | ConvertTo-Json
 
-Invoke-WebRequest -Uri http://<your-server-ip>:9000/v1/chat/completions -Method POST -Headers $headers -Body $body
+Invoke-WebRequest -Uri http://<your-server-ip>:9003/v1/chat/completions -Method POST -Headers $headers -Body $body
 ```
 
 **Example using `curl`:**
 
 ```bash
-curl http://<your-server-ip>:9000/v1/chat/completions \
+curl http://<your-server-ip>:9003/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d 
+  -d
   {
     "model": "gemma3-4B",
     "messages": [
