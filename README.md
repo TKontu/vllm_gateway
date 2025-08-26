@@ -1,10 +1,10 @@
-# vLLM Dynamic Gateway
+# vLLM Smart Gateway
 
-This project provides a smart gateway that acts as a dynamic proxy for the [vLLM inference engine](https://github.com/vllm-project/vllm). Its primary goal is to enable the seamless, local serving of multiple large language models on a single GPU with **zero-effort model switching**.
+This project provides a smart, dynamic gateway for the [vLLM inference engine](https://github.com/vllm-project/vllm). It enables the serving of multiple large language models on a single GPU, with intelligent, on-demand model loading, unloading, and VRAM management.
 
-When an API request for a specific model is received, the gateway automatically handles the backend logistics: if the requested model isn't already loaded, it will gracefully stop the current vLLM container and launch a new one with the correct model, all without any manual intervention.
+The gateway can run multiple models concurrently if they fit in VRAM, or swap them based on a least-recently-used (LRU) policy if they don't. It automatically learns the VRAM footprint of each model to make efficient packing decisions.
 
-> [!WARNING] > **Security Notice**
+> [!WARNING] > **Security Notice: Requires Root-Equivalent Host Access**
 > This gateway requires direct access to the host's Docker socket (`/var/run/docker.sock`). This is equivalent to granting root access to the host system. Please be fully aware of the security implications before deploying this project. It is strongly recommended to run this in a trusted and isolated environment.
 
 ## How It Works
@@ -12,36 +12,42 @@ When an API request for a specific model is received, the gateway automatically 
 The architecture consists of a single, persistent `gateway` container that has access to the host's Docker socket.
 
 1.  An API request is sent to the gateway's `/v1/chat/completions` endpoint, specifying a model (e.g., `"model": "gemma3-4B"`).
-2.  The gateway checks if a `vllm_server` container is running and if it's loaded with the requested model.
-3.  **If the correct model is already running**, the request is simply forwarded.
-4.  **If a different model is running (or no model is running)**, the gateway stops and removes the old `vllm_server` container. It then launches a new `vllm_server` container, instructing it to load the newly requested model.
-5.  Once the new model is loaded and ready, the original request is forwarded.
+2.  The gateway checks if the requested model is already running in a `vllm_server` container.
+3.  **If the model is running**, the request is forwarded.
+4.  **If the model is not running**, the gateway checks its VRAM footprint.
+    - **Unknown Footprint (First Run):** The gateway stops all other models, starts the requested one in isolation, measures its VRAM usage, and saves the footprint to `memory_footprints.json`.
+    - **Known Footprint:** The gateway checks if there is enough free VRAM.
+      - If it fits, the model is started alongside other models.
+      - If it doesn't fit, the gateway evicts the least recently used model(s) until there is enough space.
+5.  Once the model is ready, the request is forwarded.
 
-This entire process is transparent to the end-user, who simply experiences a slightly longer response time for the first request to a new model.
+This process is transparent to the end-user, who simply experiences a longer response time for the first request to a new or swapped model.
 
 ## Key Features
 
-- **Dynamic Model Switching:** Automatically manages and swaps vLLM containers based on incoming API requests.
-- **Efficient Resource Management:** Only one resource-intensive vLLM model occupies GPU VRAM at any given time.
-- **Standard OpenAI API:** Uses the familiar `/v1/chat/completions` endpoint, making it a drop-in replacement for many applications.
-- **Concurrent Request Safety:** Uses an `asyncio.Lock` to ensure that simultaneous requests for different models are handled safely and queud, preventing race conditions.
-- **Highly Configurable:** Control allowed models, GPU memory utilization, and networking via environment variables.
+- **Dynamic VRAM Management:** Intelligently loads and unloads models to maximize GPU utilization.
+- **Concurrent Model Serving:** Runs multiple models simultaneously if they fit in VRAM.
+- **Footprint Learning:** Automatically measures and records the VRAM footprint of new models.
+- **LRU Eviction Policy:** Gracefully swaps models when space is needed.
+- **Inactivity Timeout:** Automatically shuts down idle model containers to free up resources.
+- **Standard OpenAI API:** Uses the familiar `/v1/chat/completions` and `/v1/models` endpoints.
+- **Concurrent Request Safety:** Uses an `asyncio.Lock` to handle simultaneous requests safely.
+- **Highly Configurable:** Control models, networking, and resource limits via environment variables.
 
-## Deployment (Portainer / Docker Compose)
+## Deployment (Docker Compose)
 
-This gateway is designed to be deployed as a standalone service that dynamically manages other containers. Below is a sample `docker-compose.yml` for deploying it in Portainer.
+This gateway is designed to be deployed as a standalone service that dynamically manages other containers.
 
 ```yaml
 version: "3.9"
 
-# Define the shared network
 networks:
   vllm_network:
     driver: bridge
 
 services:
   gateway:
-    # Build the image locally or pull from a registry
+    # Build the image locally using the gateway/Dockerfile
     image: my-vlmm-gateway:latest
     container_name: vllm_gateway
     ports:
@@ -49,33 +55,36 @@ services:
     environment:
       # --- REQUIRED ---
       # Your Hugging Face token for accessing gated models.
-      # You can also set this in your environment.
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+      # The name of this gateway container, used to resolve the Docker network.
+      GATEWAY_CONTAINER_NAME: "vllm_gateway"
 
       # --- NETWORKING ---
       # The network to attach the vLLM container to. Must match the network defined above.
       DOCKER_NETWORK_NAME: "vllm_network"
-      # The hostname for the vLLM container.
-      VLLM_HOST: "vllm_server"
 
-      # --- CONFIGURATION ---
-      # A JSON string defining the user-friendly names and their corresponding Hugging Face model IDs.
+      # --- MODEL & RESOURCE CONFIGURATION ---
+      # A JSON string defining the user-friendly names and their Hugging Face model IDs.
       ALLOWED_MODELS_JSON: '{"gemma3-4B":"google/gemma-3-4b-it", "qwen2.5":"Qwen/Qwen2.5-Coder-7B-Instruct"}'
+      # The percentage of GPU memory vLLM should be allowed to use (e.g., "0.90" for 90%).
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
+      # Timeout in seconds to shut down inactive model containers. Set to 0 to disable.
+      VLLM_INACTIVITY_TIMEOUT: "1800" # 30 minutes
+      # Global cap on model context length. 0 means use the model's default.
+      VLLM_MAX_MODEL_LEN_GLOBAL: "0"
+      # vLLM CPU swap space in GB.
+      VLLM_SWAP_SPACE: "16"
 
-      # The percentage of GPU memory vLLM should be allowed to use (e.g., "0.85" for 85%).
-      # You can also set this in your environment.
-      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.85}
+      # --- LOGGING ---
+      LOG_LEVEL: "INFO" # DEBUG, INFO, WARNING, ERROR
 
     volumes:
       # [SECURITY WARNING] Mount the Docker socket to allow the gateway to manage containers.
-      # This grants the container root-level access to the host.
       - /var/run/docker.sock:/var/run/docker.sock
-      # Mount the Hugging Face cache to avoid re-downloading models
+      # Mount the Hugging Face cache to avoid re-downloading models.
       - /root/.cache/huggingface:/root/.cache/huggingface
-      # Mount for the VRAM utilzation needs
+      # Mount a file to persist learned VRAM footprints. Must be a file, not a directory.
       - ./memory_footprints.json:/app/memory_footprints.json
-
-    # Attach the gateway to the shared network
     networks:
       - vllm_network
     restart: unless-stopped
@@ -89,39 +98,20 @@ To build the `my-vlmm-gateway:latest` image, navigate to the `gateway` directory
 docker build -t my-vlmm-gateway:latest .
 ```
 
-## Making an API Call
+## API Usage
 
-Once the gateway is running, you can send requests to it as you would to the OpenAI API. The `model` parameter should be one of the keys you defined in the `ALLOWED_MODELS_JSON` environment variable.
+### Making an API Call
 
-> **Note on Model Loading:** The first time you request a new model, there will be a delay of a few minutes as the gateway downloads the model and starts the container. Subsequent requests to the same model will be much faster.
+Send requests to the gateway as you would to the OpenAI API. The `model` parameter must be one of the keys defined in `ALLOWED_MODELS_JSON`.
 
-**Example using PowerShell:**
-
-```powershell
-$headers = @{
-    "Content-Type" = "application/json"
-}
-
-$body = @{
-    model    = "gemma3-4B" # This must match a key in ALLOWED_MODELS_JSON
-    messages = @(
-        @{
-            role    = "user"
-            content = "What are the top 3 benefits of using Docker?"
-        }
-    )
-} | ConvertTo-Json
-
-Invoke-WebRequest -Uri http://<your-server-ip>:9003/v1/chat/completions -Method POST -Headers $headers -Body $body
-```
+> **Note on Model Loading:** The first time you request a new model, there will be a delay as the gateway downloads the model and starts the container. If it's a "discovery run," other models will be temporarily stopped.
 
 **Example using `curl`:**
 
 ```bash
 curl http://<your-server-ip>:9003/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d
-  {
+  -d '{
     "model": "gemma3-4B",
     "messages": [
       {
@@ -129,5 +119,10 @@ curl http://<your-server-ip>:9003/v1/chat/completions \
         "content": "What are the top 3 benefits of using Docker?"
       }
     ]
-  }
+  }'
 ```
+
+### Gateway Endpoints
+
+- **`GET /v1/models`**: Lists the models allowed by the gateway (as defined in `ALLOWED_MODELS_JSON`).
+- **`GET /gateway/status`**: Returns a JSON object with the current status of the gateway, including total VRAM, known footprints, and a list of active model containers.
