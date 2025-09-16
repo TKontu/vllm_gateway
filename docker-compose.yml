@@ -1,11 +1,12 @@
-version: "3.9"
-
 networks:
   vllm_network:
     driver: bridge
 
 services:
   gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
     image: my-vlmm-gateway:latest
     container_name: vllm_gateway
     ports:
