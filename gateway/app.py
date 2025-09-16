@@ -24,6 +24,8 @@ VLLM_IMAGE = "vllm/vllm-openai:latest"
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
 VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16")
 VLLM_MAX_MODEL_LEN_GLOBAL = int(os.getenv("VLLM_MAX_MODEL_LEN_GLOBAL", "0"))
+VLLM_MAX_NUM_SEQS = os.getenv("VLLM_MAX_NUM_SEQS", "16")
+VLLM_TENSOR_PARALLEL_SIZE = os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")
 DOCKER_NETWORK_NAME = os.getenv("DOCKER_NETWORK_NAME", "vllm_network")
 GATEWAY_CONTAINER_NAME = os.getenv("GATEWAY_CONTAINER_NAME", "vllm_gateway")
 VLLM_INACTIVITY_TIMEOUT = int(os.getenv("VLLM_INACTIVITY_TIMEOUT", 1800))
@@ -211,6 +213,12 @@ async def start_model_container(model_id: str, container_name: str) -> Container
         command.extend(["--swap-space", VLLM_SWAP_SPACE])
     if final_max_len > 0:
         command.extend(["--max-model-len", str(final_max_len)])
+
+    if int(VLLM_MAX_NUM_SEQS) > 0:
+        command.extend(["--max-num-seqs", VLLM_MAX_NUM_SEQS])
+
+    if int(VLLM_TENSOR_PARALLEL_SIZE) > 0:
+        command.extend(["--tensor-parallel-size", VLLM_TENSOR_PARALLEL_SIZE])
 
     try:
         logging.info(f"Starting container {container_name} with command: {' '.join(command)}")
