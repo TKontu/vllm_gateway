@@ -286,14 +286,17 @@ async def start_model_container(model_id: str, container_name: str) -> Container
         new_container.reload()
         ip_address = new_container.attrs['NetworkSettings']['Networks'][RESOLVED_DOCKER_NETWORK]['IPAddress']
         
-        # Health check loop
+        # Health check loop with progress logging
         vllm_base_url = f"http://{ip_address}:{VLLM_PORT}"
-        for i in range(300): # ~10 minutes timeout (300 * 2s = 600s)
+        logging.info(f"Starting health checks for {model_id}. This may take several minutes for large models...")
+
+        for i in range(1800): # ~1 hour timeout (1800 * 2s = 3600s)
             await asyncio.sleep(2)
             try:
                 response = await http_client.get(f"{vllm_base_url}/health", timeout=2)
                 if response.status_code == 200:
-                    logging.info(f"Model {model_id} started successfully at {vllm_base_url}.")
+                    elapsed_time = (i + 1) * 2
+                    logging.info(f"Model {model_id} started successfully at {vllm_base_url} after {elapsed_time}s.")
                     return ContainerState(
                         model_id=model_id,
                         container_name=container_name,
@@ -303,10 +306,19 @@ async def start_model_container(model_id: str, container_name: str) -> Container
                         vram_footprint=0 # Footprint is unknown until measured
                     )
             except httpx.RequestError:
-                if i > 5:
-                    logging.info(f"Waiting for model {model_id} to be ready... (attempt {i+1})")
+                # Log progress every 30 seconds (15 attempts * 2s)
+                if i > 0 and (i + 1) % 15 == 0:
+                    elapsed_time = (i + 1) * 2
+                    remaining_time = (1800 - i - 1) * 2
+                    elapsed_min = elapsed_time // 60
+                    remaining_min = remaining_time // 60
+                    logging.info(f"Model {model_id} still loading... ({elapsed_min}m {elapsed_time % 60}s elapsed, {remaining_min}m {remaining_time % 60}s remaining)")
+                elif i <= 5:
+                    logging.info(f"Waiting for model {model_id} to initialize... (attempt {i+1})")
 
-        logging.error(f"Model {model_id} failed to start in the allocated time.")
+        elapsed_time = 1800 * 2
+        elapsed_min = elapsed_time // 60
+        logging.error(f"Model {model_id} failed to start after {elapsed_min}m timeout.")
         await stop_container(container_name)
         return None
 
