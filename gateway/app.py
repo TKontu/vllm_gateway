@@ -111,6 +111,29 @@ def get_used_vram() -> float:
         logging.error("Could not determine used GPU VRAM.")
         return 0.0
 
+def is_gguf_model(model_id: str) -> bool:
+    """Check if the model_id refers to a GGUF file."""
+    return (model_id.endswith('.gguf') or
+            model_id.startswith(('http://', 'https://')) and model_id.endswith('.gguf') or
+            ('/' in model_id and model_id.split('/')[-1].endswith('.gguf')))
+
+def extract_tokenizer_from_gguf_path(model_path: str) -> str:
+    """Extract tokenizer path from GGUF model path for better compatibility."""
+    if model_path.endswith('.gguf'):
+        if model_path.startswith(('http://', 'https://')):
+            # Extract repo from HuggingFace URL
+            # https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/file.gguf
+            # -> TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
+            if 'huggingface.co/' in model_path:
+                parts = model_path.split('huggingface.co/')[-1].split('/')
+                if len(parts) >= 2:
+                    return f"{parts[0]}/{parts[1]}"
+        elif '/' in model_path:
+            # For repo_id/filename.gguf format, use the repo_id as tokenizer
+            repo_id = model_path.rsplit('/', 1)[0]
+            return repo_id
+    return ""
+
 def load_allowed_models():
     """Load allowed models from environment variable."""
     models_json = os.getenv("ALLOWED_MODELS_JSON")
@@ -184,7 +207,17 @@ async def stop_container(container_name: str):
 
 async def get_model_max_len(model_id: str) -> int:
     """Fetches the model's config.json from Hugging Face to find its max length."""
-    config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
+    # For GGUF models, try to get config from the base model if available
+    if is_gguf_model(model_id):
+        tokenizer_path = extract_tokenizer_from_gguf_path(model_id)
+        if tokenizer_path:
+            config_url = f"https://huggingface.co/{tokenizer_path}/raw/main/config.json"
+        else:
+            # Skip max length detection for GGUF models without clear tokenizer path
+            return 0
+    else:
+        config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(config_url, follow_redirects=True)
@@ -209,6 +242,16 @@ async def start_model_container(model_id: str, container_name: str) -> Container
         final_max_len = min(model_max_len, VLLM_MAX_MODEL_LEN_GLOBAL) if model_max_len > 0 else VLLM_MAX_MODEL_LEN_GLOBAL
 
     command = ["--model", model_id, "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION]
+
+    # Add GGUF-specific parameters if this is a GGUF model
+    if is_gguf_model(model_id):
+        tokenizer_path = extract_tokenizer_from_gguf_path(model_id)
+        if tokenizer_path:
+            command.extend(["--tokenizer", tokenizer_path])
+            logging.info(f"Using tokenizer {tokenizer_path} for GGUF model {model_id}")
+        else:
+            logging.warning(f"No tokenizer path found for GGUF model {model_id}. Using model's embedded tokenizer.")
+
     if int(VLLM_SWAP_SPACE) > 0:
         command.extend(["--swap-space", VLLM_SWAP_SPACE])
     if final_max_len > 0:
@@ -229,17 +272,23 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             hostname=container_name,
             detach=True,
             network=RESOLVED_DOCKER_NETWORK,
-            environment={"HUGGING_FACE_HUB_TOKEN": HF_TOKEN},
+            environment={
+                "HUGGING_FACE_HUB_TOKEN": HF_TOKEN,
+                "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+            },
             ipc_mode="host",
             device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])],
-            volumes={os.path.expanduser("~/.cache/huggingface"): {'bind': '/root/.cache/huggingface', 'mode': 'rw'}}
+            volumes={
+                os.path.expanduser("~/.cache/huggingface"): {'bind': '/root/.cache/huggingface', 'mode': 'rw'},
+                "/tmp": {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
+            }
         )
         new_container.reload()
         ip_address = new_container.attrs['NetworkSettings']['Networks'][RESOLVED_DOCKER_NETWORK]['IPAddress']
         
         # Health check loop
         vllm_base_url = f"http://{ip_address}:{VLLM_PORT}"
-        for i in range(90): # ~3 minutes timeout
+        for i in range(300): # ~10 minutes timeout (300 * 2s = 600s)
             await asyncio.sleep(2)
             try:
                 response = await http_client.get(f"{vllm_base_url}/health", timeout=2)
@@ -256,7 +305,7 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             except httpx.RequestError:
                 if i > 5:
                     logging.info(f"Waiting for model {model_id} to be ready... (attempt {i+1})")
-        
+
         logging.error(f"Model {model_id} failed to start in the allocated time.")
         await stop_container(container_name)
         return None
