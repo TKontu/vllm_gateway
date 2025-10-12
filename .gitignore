@@ -3,3 +3,4 @@ my-vllm-gateway.tar
 *.log
 /venv/*
 my-vlmm-gateway.tar
+*.md
