@@ -50,7 +50,7 @@ networks:
 services:
   gateway:
     # Build the image locally using the gateway/Dockerfile
-    image: my-vlmm-gateway:latest
+    image: my-vllm-gateway:latest
     container_name: vllm_gateway
     ports:
       - "9003:9000" # Expose the gateway on port 9003
@@ -95,10 +95,10 @@ services:
 
 ### Building the Gateway Image
 
-To build the `my-vlmm-gateway:latest` image, navigate to the `gateway` directory and run:
+To build the `my-vllm-gateway:latest` image, navigate to the `gateway` directory and run:
 
 ```bash
-docker build -t my-vlmm-gateway:latest .
+docker build -t my-vllm-gateway:latest .
 ```
 
 ## API Usage

@@ -7,21 +7,46 @@ services:
     build:
       context: ./gateway
       dockerfile: Dockerfile
-    image: my-vlmm-gateway:latest
+    image: my-vllm-gateway:latest
     container_name: vllm_gateway
     ports:
       - "9003:9000"
     environment:
+      # --- REQUIRED ---
       HUGGING_FACE_HUB_TOKEN: ${HUGGING_FACE_HUB_TOKEN}
+      VLLM_IMAGE: ${VLLM_IMAGE:-vllm/vllm-openai:latest}
+      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION}
+      VLLM_SWAP_SPACE: "4"
+      VLLM_MAX_MODEL_LEN_GLOBAL: "40000"
+      VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS:-16}
+      VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE:-1}
+      LOG_LEVEL: "DEBUG"
+
+      # --- NETWORKING ---
       DOCKER_NETWORK_NAME: vllm_network
       GATEWAY_CONTAINER_NAME: "vllm_gateway"
       VLLM_HOST: vllm_server
-      VLLM_INACTIVITY_TIMEOUT: "1800"
-      ALLOWED_MODELS_JSON: '{"gemma3-4B":"google/gemma-3-4b-it","gemma3-12B":"google/gemma-3-12b-it","qwen2.5":"Qwen/Qwen2.5-Coder-7B-Instruct", "gpt-oss":"openai/gpt-oss-20b", "deepseek-r1-14B":"deepseek-ai/DeepSeek-R1-Distill-Qwen-14B", "bge-large":"BAAI/bge-large-en-v1.5"}'
-      VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION}
-      VLLM_MAX_NUM_SEQS: ${VLLM_MAX_NUM_SEQS:-16}
-      LOG_LEVEL: "DEBUG"
-      VLLM_TENSOR_PARALLEL_SIZE: ${VLLM_TENSOR_PARALLEL_SIZE:-1}
+      VLLM_INACTIVITY_TIMEOUT: "7200"
+
+      # --- PATHS ---
+      HOST_CACHE_DIR: "/root/.cache/huggingface"
+
+      # --- CONFIGURABLE ALLOWED MODELS ---
+      ALLOWED_MODELS_JSON: |
+        {
+          "gemma3-4B": "google/gemma-3-4b-it",
+          "gemma3-12b-q4": "google/gemma-3-12b-it-qat-q4_0-gguf",
+          "gemma3-12b-awq": "gaunernst/gemma-3-12b-it-qat-autoawq",
+          "gemma3-27B": "gaunernst/gemma-3-27b-it-int4-awq",
+          "gemma3-27b-4bit": "unsloth/gemma-3-27b-it-qat-unsloth-bnb-4bit",
+          "qwen2.5-coder": "Qwen/Qwen2.5-Coder-7B-Instruct",
+          "qwen3-8B": "Qwen/Qwen3-8B",
+          "deepseek-r1-7B": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+          "deepseek-r1-32B": "Valdemardi/DeepSeek-R1-Distill-Qwen-32B-AWQ",
+          "llama3-8B": "meta-llama/Meta-Llama-3-8B-Instruct",
+          "bge-large-en": "BAAI/bge-large-en-v1.5"
+        }
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /root/.cache/huggingface:/root/.cache/huggingface

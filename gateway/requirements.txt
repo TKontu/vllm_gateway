@@ -3,3 +3,4 @@ uvicorn
 httpx
 docker
 vllm>=0.6.0
+huggingface_hub

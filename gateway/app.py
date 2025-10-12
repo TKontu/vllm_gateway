@@ -6,12 +6,14 @@ import json
 import time
 import logging
 import subprocess
+from functools import partial
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from docker.types import DeviceRequest
 from docker.errors import NotFound, APIError
 from starlette.middleware.base import BaseHTTPMiddleware
 from dataclasses import dataclass, field
+from huggingface_hub import hf_hub_download, list_repo_files
 
 # --- Logging Configuration ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -19,8 +21,9 @@ logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - %(mes
 
 # --- Configuration ---
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN", "")
+HOST_CACHE_DIR = os.getenv("HOST_CACHE_DIR", "/root/.cache/huggingface")
 VLLM_PORT = 8000
-VLLM_IMAGE = "vllm/vllm-openai:latest"
+VLLM_IMAGE = os.getenv("VLLM_IMAGE", "vllm/vllm-openai:latest")
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
 VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16")
 VLLM_MAX_MODEL_LEN_GLOBAL = int(os.getenv("VLLM_MAX_MODEL_LEN_GLOBAL", "0"))
@@ -39,6 +42,7 @@ TOTAL_GPU_VRAM = 0  # in MiB
 known_footprints = {}
 active_containers = {}
 model_management_lock = asyncio.Lock()
+download_locks = {}  # model_id -> asyncio.Lock for preventing concurrent downloads
 
 @dataclass
 class ContainerState:
@@ -133,6 +137,116 @@ def extract_tokenizer_from_gguf_path(model_path: str) -> str:
             repo_id = model_path.rsplit('/', 1)[0]
             return repo_id
     return ""
+
+def is_gguf_repo(model_id: str) -> bool:
+    """Check if model_id is a HuggingFace repo containing GGUF files (not a local path)."""
+    # Format: org/repo or user/repo, contains -gguf or -GGUF in the repo name
+    return ('/' in model_id and
+            not model_id.startswith('/') and
+            not model_id.endswith('.gguf') and
+            ('-gguf' in model_id.lower() or 'gguf' in model_id.lower()))
+
+def infer_base_model_from_gguf_repo(gguf_repo_id: str) -> str:
+    """
+    Infer the base model repo from a GGUF repo name.
+    Examples:
+      - google/gemma-3-12b-it-qat-q4_0-gguf -> google/gemma-3-12b-it
+      - TheBloke/Llama-2-7B-GGUF -> meta-llama/Llama-2-7b-hf
+    """
+    import re
+
+    # Extract org/repo parts
+    parts = gguf_repo_id.split('/')
+    if len(parts) != 2:
+        return None
+
+    org, repo_name = parts
+
+    # Remove common GGUF suffixes
+    # Patterns: -gguf, -GGUF, -qat-q4_0-gguf, -q4_0-gguf, -int4-gguf, etc.
+    base_name = re.sub(r'-?(qat-)?q\d+[_-]?[k0-9]*-?gguf$', '', repo_name, flags=re.IGNORECASE)
+    base_name = re.sub(r'-?gguf$', '', base_name, flags=re.IGNORECASE)
+    base_name = re.sub(r'-?int\d+-?gguf$', '', base_name, flags=re.IGNORECASE)
+
+    # If from TheBloke or similar, try to map to original model
+    # For now, just use the cleaned name with same org
+    base_model = f"{org}/{base_name}"
+
+    logging.info(f"Inferred base model '{base_model}' from GGUF repo '{gguf_repo_id}'")
+    return base_model
+
+async def download_gguf_from_repo(repo_id: str) -> tuple[str, str]:
+    """
+    Downloads a GGUF file from a HuggingFace repo and returns (local_path, tokenizer_repo).
+    Returns the path to the downloaded GGUF file and the inferred base model repo for tokenizer.
+    Uses async executor to avoid blocking the event loop during large downloads.
+    """
+    try:
+        logging.info(f"Attempting to download GGUF file from repo: {repo_id}")
+
+        # Prepare token (handle empty strings)
+        token = HF_TOKEN if HF_TOKEN and HF_TOKEN.strip() else None
+
+        # List all files in the repo to find .gguf files (run in thread pool)
+        loop = asyncio.get_event_loop()
+        files = await loop.run_in_executor(
+            None,
+            partial(list_repo_files, repo_id, token=token)
+        )
+        gguf_files = [f for f in files if f.endswith('.gguf')]
+
+        if not gguf_files:
+            raise ValueError(f"No GGUF files found in repo {repo_id}")
+
+        # Smart GGUF file selection: prefer file matching quantization hint in repo name
+        # e.g., "google/gemma-3-12b-it-qat-q4_0-gguf" -> prefer files with "q4_0"
+        gguf_filename = gguf_files[0]  # Default to first file
+
+        if len(gguf_files) > 1:
+            # Extract potential quantization hint from repo name
+            repo_name = repo_id.split('/')[-1]  # e.g., "gemma-3-12b-it-qat-q4_0-gguf"
+
+            # Look for quantization patterns like q4_0, q4_1, q8_0, etc.
+            import re
+            quant_patterns = re.findall(r'q\d+_[k0-9]+|q\d+', repo_name.lower())
+
+            if quant_patterns:
+                quant_hint = quant_patterns[-1]  # Use last match (usually most specific)
+                matching_files = [f for f in gguf_files if quant_hint in f.lower()]
+
+                if matching_files:
+                    gguf_filename = matching_files[0]
+                    logging.info(f"Selected GGUF file '{gguf_filename}' based on quantization hint '{quant_hint}'")
+                else:
+                    logging.warning(f"No GGUF file matched quantization hint '{quant_hint}', using '{gguf_filename}'")
+
+            logging.info(f"Found {len(gguf_files)} GGUF files, selected: {gguf_filename}")
+        else:
+            logging.info(f"Found GGUF file: {gguf_filename}")
+
+        # Download the file using huggingface_hub (run in thread pool to avoid blocking)
+        logging.info(f"Downloading {gguf_filename}... (this may take several minutes for large files)")
+        local_path = await loop.run_in_executor(
+            None,
+            partial(
+                hf_hub_download,
+                repo_id=repo_id,
+                filename=gguf_filename,
+                token=token,
+                cache_dir="/root/.cache/huggingface"
+            )
+        )
+
+        logging.info(f"Successfully downloaded GGUF file to: {local_path}")
+
+        # Infer base model for tokenizer
+        base_model = infer_base_model_from_gguf_repo(repo_id)
+
+        return local_path, base_model
+
+    except Exception as e:
+        logging.error(f"Failed to download GGUF file from {repo_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to download GGUF model: {e}")
 
 def load_allowed_models():
     """Load allowed models from environment variable."""
@@ -236,21 +350,42 @@ async def start_model_container(model_id: str, container_name: str) -> Container
     """Starts a new vLLM container."""
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
 
-    model_max_len = await get_model_max_len(model_id)
+    # Handle GGUF repos by downloading first
+    actual_model_path = model_id
+    tokenizer_repo = None
+
+    if is_gguf_repo(model_id):
+        # Ensure only one download per model at a time (prevent race conditions)
+        if model_id not in download_locks:
+            download_locks[model_id] = asyncio.Lock()
+
+        async with download_locks[model_id]:
+            logging.info(f"Detected GGUF repo: {model_id}. Downloading GGUF file...")
+            actual_model_path, tokenizer_repo = await download_gguf_from_repo(model_id)
+            logging.info(f"Will use local GGUF path: {actual_model_path}")
+
+    model_max_len = await get_model_max_len(tokenizer_repo if tokenizer_repo else model_id)
     final_max_len = model_max_len
     if VLLM_MAX_MODEL_LEN_GLOBAL > 0:
         final_max_len = min(model_max_len, VLLM_MAX_MODEL_LEN_GLOBAL) if model_max_len > 0 else VLLM_MAX_MODEL_LEN_GLOBAL
 
-    command = ["--model", model_id, "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION]
+    command = ["--model", actual_model_path, "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION]
 
     # Add GGUF-specific parameters if this is a GGUF model
-    if is_gguf_model(model_id):
-        tokenizer_path = extract_tokenizer_from_gguf_path(model_id)
-        if tokenizer_path:
-            command.extend(["--tokenizer", tokenizer_path])
-            logging.info(f"Using tokenizer {tokenizer_path} for GGUF model {model_id}")
+    if is_gguf_model(actual_model_path) or tokenizer_repo:
+        # If we downloaded from a repo, use that repo as tokenizer
+        if tokenizer_repo:
+            command.extend(["--tokenizer", tokenizer_repo])
+            command.extend(["--hf-config-path", tokenizer_repo])
+            logging.info(f"Using tokenizer and config from {tokenizer_repo} for GGUF model")
         else:
-            logging.warning(f"No tokenizer path found for GGUF model {model_id}. Using model's embedded tokenizer.")
+            tokenizer_path = extract_tokenizer_from_gguf_path(actual_model_path)
+            if tokenizer_path:
+                command.extend(["--tokenizer", tokenizer_path])
+                command.extend(["--hf-config-path", tokenizer_path])
+                logging.info(f"Using tokenizer and config from {tokenizer_path} for GGUF model {model_id}")
+            else:
+                logging.warning(f"No tokenizer path found for GGUF model {model_id}. Using model's embedded tokenizer.")
 
     if int(VLLM_SWAP_SPACE) > 0:
         command.extend(["--swap-space", VLLM_SWAP_SPACE])
@@ -279,7 +414,7 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             ipc_mode="host",
             device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])],
             volumes={
-                os.path.expanduser("~/.cache/huggingface"): {'bind': '/root/.cache/huggingface', 'mode': 'rw'},
+                HOST_CACHE_DIR: {'bind': '/root/.cache/huggingface', 'mode': 'rw'},
                 "/tmp": {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
             }
         )

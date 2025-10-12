@@ -1,3 +1,5 @@
 .env
-my-vlmm-gateway.tar
+my-vllm-gateway.tar
 *.log
+/venv/*
+my-vlmm-gateway.tar
