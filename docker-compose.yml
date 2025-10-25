@@ -28,4 +28,4 @@ services:
     networks:
       - vllm_network
 
-    restart: unless-stoppedBAAI/bge-reranker-v2-m3
+    restart: unless-stopped
