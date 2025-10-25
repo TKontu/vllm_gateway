@@ -4,6 +4,8 @@ This project provides a smart, dynamic gateway for the [vLLM inference engine](h
 
 The gateway can run multiple models concurrently if they fit in VRAM, or swap them based on a least-recently-used (LRU) policy if they don't. It automatically learns the VRAM footprint of each model to make efficient packing decisions.
 
+**✨ Now supports GGUF quantized models** for memory-efficient inference with automatic tokenizer detection.
+
 > [!WARNING] > **Security Notice: Requires Root-Equivalent Host Access**
 > This gateway requires direct access to the host's Docker socket (`/var/run/docker.sock`). This is equivalent to granting root access to the host system. Please be fully aware of the security implications before deploying this project. It is strongly recommended to run this in a trusted and isolated environment.
 
@@ -48,7 +50,7 @@ networks:
 services:
   gateway:
     # Build the image locally using the gateway/Dockerfile
-    image: my-vlmm-gateway:latest
+    image: my-vllm-gateway:latest
     container_name: vllm_gateway
     ports:
       - "9003:9000" # Expose the gateway on port 9003
@@ -64,13 +66,14 @@ services:
       DOCKER_NETWORK_NAME: "vllm_network"
 
       # --- MODEL & RESOURCE CONFIGURATION ---
-      # A JSON string defining the user-friendly names and their Hugging Face model IDs.
-      ALLOWED_MODELS_JSON: '{"gemma3-4B":"google/gemma-3-4b-it", "qwen2.5":"Qwen/Qwen2.5-Coder-7B-Instruct"}'
+      # A JSON string defining user-friendly names and their model paths.
+      # Supports regular HF models and GGUF files (local, URLs, or repo/file.gguf format).
+      ALLOWED_MODELS_JSON: '{"gemma3-4B":"google/gemma-3-4b-it", "qwen2.5":"Qwen/Qwen2.5-Coder-7B-Instruct", "tinyllama-gguf":"TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"}'
       # The percentage of GPU memory vLLM should be allowed to use (e.g., "0.90" for 90%).
       VLLM_GPU_MEMORY_UTILIZATION: ${VLLM_GPU_MEMORY_UTILIZATION:-0.90}
       # Timeout in seconds to shut down inactive model containers. Set to 0 to disable.
       VLLM_INACTIVITY_TIMEOUT: "1800" # 30 minutes
-      # Global cap on model context length. 0 means use the model's default.
+      # Global cap on model context length. 0 means use model's native max length.
       VLLM_MAX_MODEL_LEN_GLOBAL: "0"
       # vLLM CPU swap space in GB.
       VLLM_SWAP_SPACE: "16"
@@ -92,10 +95,10 @@ services:
 
 ### Building the Gateway Image
 
-To build the `my-vlmm-gateway:latest` image, navigate to the `gateway` directory and run:
+To build the `my-vllm-gateway:latest` image, navigate to the `gateway` directory and run:
 
 ```bash
-docker build -t my-vlmm-gateway:latest .
+docker build -t my-vllm-gateway:latest .
 ```
 
 ## API Usage
