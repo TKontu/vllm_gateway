@@ -383,6 +383,38 @@ async def start_model_container(model_id: str, container_name: str) -> Container
     """Starts a new vLLM container."""
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
 
+    # Clean up any existing container with the same name (from crashes or improper shutdowns)
+    try:
+        existing_container = docker_client.containers.get(container_name)
+        logging.warning(f"Found existing container {container_name}. Removing it before starting new one.")
+        try:
+            existing_container.stop(timeout=10)
+        except Exception as e:
+            logging.warning(f"Could not stop existing container {container_name}: {e}")
+        existing_container.remove(force=True)
+        logging.info(f"Removed stale container {container_name}")
+
+        # Verify container is actually removed before proceeding
+        for attempt in range(10):
+            try:
+                docker_client.containers.get(container_name)
+                # Container still exists, wait and retry
+                await asyncio.sleep(0.5)
+            except NotFound:
+                # Container is gone, we can proceed
+                break
+        else:
+            # After 10 attempts, container still exists
+            logging.error(f"Failed to remove container {container_name} after 10 attempts")
+            raise HTTPException(status_code=500, detail=f"Failed to remove existing container {container_name}")
+
+    except NotFound:
+        # No existing container, this is the expected case
+        pass
+    except APIError as e:
+        logging.error(f"Error checking/removing existing container {container_name}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to handle existing container: {e}")
+
     # Handle GGUF repos by downloading first
     actual_model_path = model_id
     tokenizer_repo = None
@@ -705,6 +737,9 @@ async def proxy_request(request: Request):
             if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding')
         }
 
+        # Check if this is a streaming request
+        is_streaming = body.get('stream', False)
+
         # Proxy request using the original HTTP method
         response = await http_client.request(
             method=request.method,
@@ -714,7 +749,26 @@ async def proxy_request(request: Request):
             timeout=300
         )
         response.raise_for_status()
-        return JSONResponse(content=response.json(), status_code=response.status_code)
+
+        # Handle streaming vs non-streaming responses
+        if is_streaming:
+            # For streaming responses, return the raw content with appropriate headers
+            from fastapi.responses import StreamingResponse
+
+            async def generate():
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+            return StreamingResponse(
+                generate(),
+                status_code=response.status_code,
+                media_type=response.headers.get('content-type', 'text/event-stream'),
+                headers={k: v for k, v in response.headers.items()
+                        if k.lower() not in ('content-length', 'transfer-encoding', 'connection')}
+            )
+        else:
+            # For non-streaming responses, return JSON as before
+            return JSONResponse(content=response.json(), status_code=response.status_code)
     except httpx.HTTPStatusError as e:
         return JSONResponse({"error": "Error from vLLM service", "details": str(e)}, status_code=e.response.status_code)
     except httpx.RequestError as e:
