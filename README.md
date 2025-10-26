@@ -101,6 +101,127 @@ To build the `my-vllm-gateway:latest` image, navigate to the `gateway` directory
 docker build -t my-vllm-gateway:latest .
 ```
 
+## Configuration
+
+All configuration is done via environment variables, making it easy to deploy with Portainer, Kubernetes, or directly from GitHub.
+
+### Using .env File
+
+For easier management, create a `.env` file in your project root:
+
+```bash
+# Copy the example file
+cp .env.example .env
+
+# Edit with your values
+nano .env
+```
+
+The `.env` file will be automatically loaded by Docker Compose.
+
+### Environment Variables Reference
+
+#### Required Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HUGGING_FACE_HUB_TOKEN` | - | **Required** for gated models. Get from https://huggingface.co/settings/tokens |
+
+#### vLLM Engine Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `VLLM_IMAGE` | `vllm/vllm-openai:v0.10.2` | Docker image for vLLM model containers |
+| `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | GPU memory utilization (0.0 to 1.0) |
+| `VLLM_SWAP_SPACE` | `16` | CPU swap space in GB for offloading |
+| `VLLM_MAX_MODEL_LEN_GLOBAL` | `0` | Global max context length (0 = use model default) |
+| `VLLM_MAX_NUM_SEQS` | `16` | Maximum concurrent sequences |
+| `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of GPUs to split model across |
+| `VLLM_PORT` | `8000` | Internal port used by vLLM containers |
+
+#### Networking Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOCKER_NETWORK_NAME` | `vllm_network` | Docker network name for vLLM containers |
+| `GATEWAY_CONTAINER_NAME` | `vllm_gateway` | Gateway container name (must match compose) |
+| `VLLM_CONTAINER_PREFIX` | `vllm_server` | Prefix for vLLM model server containers |
+| `VLLM_INACTIVITY_TIMEOUT` | `1800` | Seconds before idle containers shutdown (0 = disabled) |
+
+#### Path Settings (Host Machine)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `HOST_CACHE_DIR` | `/root/.cache/huggingface` | HuggingFace cache directory on host |
+| `HOST_MEMORY_FOOTPRINT_FILE` | `./memory_footprints.json` | Memory footprints file on host |
+| `HOST_TEMP_DIR` | `/tmp` | Temporary directory on host |
+
+#### Path Settings (Container)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEMORY_FOOTPRINT_FILE` | `/app/memory_footprints.json` | Memory footprints file inside gateway container |
+| `VLLM_TEMP_DIR` | `/tmp` | Temporary directory inside vLLM containers |
+
+#### Docker Images
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `NVIDIA_UTILITY_IMAGE` | `nvidia/cuda:12.1.0-base-ubuntu22.04` | NVIDIA utility container for GPU queries |
+
+#### Logging
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_LEVEL` | `INFO` | Logging level (DEBUG, INFO, WARNING, ERROR, CRITICAL) |
+
+#### Model Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ALLOWED_MODELS_JSON` | See docker-compose.yml | JSON mapping of model names to HuggingFace IDs |
+
+**Example ALLOWED_MODELS_JSON:**
+
+For `.env` file (single line):
+```bash
+ALLOWED_MODELS_JSON={"gemma3-4B":"google/gemma-3-4b-it","llama3-8B":"meta-llama/Meta-Llama-3-8B-Instruct","qwen2.5":"Qwen/Qwen2.5-Coder-7B-Instruct"}
+```
+
+For Portainer or docker-compose.yml (multi-line):
+```json
+{
+  "gemma3-4B": "google/gemma-3-4b-it",
+  "llama3-8B": "meta-llama/Meta-Llama-3-8B-Instruct",
+  "qwen2.5": "Qwen/Qwen2.5-Coder-7B-Instruct",
+  "tinyllama-gguf": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF"
+}
+```
+
+The docker-compose.yml includes a default list of models that will be used if you don't override this variable.
+
+### Deployment with Portainer
+
+When deploying from GitHub using Portainer:
+
+1. **Stack Configuration**: In Portainer, create a new stack from the repository URL
+2. **Environment Variables**: Use the Portainer UI to set environment variables instead of editing files
+3. **Volumes**: Ensure paths like `HOST_CACHE_DIR` point to accessible host directories
+4. **Permissions**: Portainer must have access to `/var/run/docker.sock`
+
+**Example Portainer Environment Variables:**
+```bash
+HUGGING_FACE_HUB_TOKEN=hf_xxxxxxxxxxxxx
+HOST_CACHE_DIR=/mnt/data/huggingface
+LOG_LEVEL=INFO
+VLLM_INACTIVITY_TIMEOUT=3600
+
+# Override models (uses default from docker-compose.yml if not set)
+ALLOWED_MODELS_JSON={"my-model":"org/model-repo","another-model":"org/another-repo"}
+```
+
+**Note:** In Portainer's web UI, you can enter ALLOWED_MODELS_JSON in multi-line format for better readability.
+
 ## API Usage
 
 ### Making an API Call

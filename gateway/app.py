@@ -21,7 +21,7 @@ logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - %(mes
 # --- Configuration ---
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN", "")
 HOST_CACHE_DIR = os.getenv("HOST_CACHE_DIR", "/root/.cache/huggingface")
-VLLM_PORT = 8000
+VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_IMAGE = os.getenv("VLLM_IMAGE", "vllm/vllm-openai:v0.10.2")
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
 VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16")
@@ -31,9 +31,10 @@ VLLM_TENSOR_PARALLEL_SIZE = os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")
 DOCKER_NETWORK_NAME = os.getenv("DOCKER_NETWORK_NAME", "vllm_network")
 GATEWAY_CONTAINER_NAME = os.getenv("GATEWAY_CONTAINER_NAME", "vllm_gateway")
 VLLM_INACTIVITY_TIMEOUT = int(os.getenv("VLLM_INACTIVITY_TIMEOUT", 1800))
-VLLM_CONTAINER_PREFIX = "vllm_server"
-NVIDIA_UTILITY_IMAGE = "nvidia/cuda:12.1.0-base-ubuntu22.04"
-MEMORY_FOOTPRINT_FILE = "/app/memory_footprints.json"
+VLLM_CONTAINER_PREFIX = os.getenv("VLLM_CONTAINER_PREFIX", "vllm_server")
+NVIDIA_UTILITY_IMAGE = os.getenv("NVIDIA_UTILITY_IMAGE", "nvidia/cuda:12.1.0-base-ubuntu22.04")
+MEMORY_FOOTPRINT_FILE = os.getenv("MEMORY_FOOTPRINT_FILE", "/app/memory_footprints.json")
+VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 
 # --- Model-specific vLLM Images ---
 # Placeholder for future per-model image customization
@@ -280,7 +281,7 @@ async def download_gguf_from_repo(repo_id: str) -> tuple[str, str]:
                 repo_id=repo_id,
                 filename=gguf_filename,
                 token=token,
-                cache_dir="/root/.cache/huggingface"
+                cache_dir=HOST_CACHE_DIR
             )
         )
 
@@ -489,7 +490,7 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])],
             volumes={
                 HOST_CACHE_DIR: {'bind': '/root/.cache/huggingface', 'mode': 'rw'},
-                "/tmp": {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
+                VLLM_TEMP_DIR: {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
             }
         )
         new_container.reload()
