@@ -31,7 +31,7 @@ services:
 
       # --- PATHS ---
       HOST_CACHE_DIR: ${HOST_CACHE_DIR:-/root/.cache/huggingface}
-      MEMORY_FOOTPRINT_FILE: ${MEMORY_FOOTPRINT_FILE:-/app/memory_footprints.json}
+      MEMORY_FOOTPRINT_FILE: ${MEMORY_FOOTPRINT_FILE:-/app/data/memory_footprints.json}
       VLLM_TEMP_DIR: ${VLLM_TEMP_DIR:-/tmp}
 
       # --- DOCKER IMAGES ---
@@ -44,7 +44,8 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${HOST_CACHE_DIR:-/root/.cache/huggingface}:/root/.cache/huggingface
-      - ${HOST_MEMORY_FOOTPRINT_FILE:-./memory_footprints.json}:${MEMORY_FOOTPRINT_FILE:-/app/memory_footprints.json}
+      # Mount a directory for data persistence (app will create files inside)
+      - ${HOST_DATA_DIR:-./data}:/app/data
       - ${HOST_TEMP_DIR:-/tmp}:${VLLM_TEMP_DIR:-/tmp}
 
     networks:

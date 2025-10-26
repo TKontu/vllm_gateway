@@ -33,7 +33,7 @@ GATEWAY_CONTAINER_NAME = os.getenv("GATEWAY_CONTAINER_NAME", "vllm_gateway")
 VLLM_INACTIVITY_TIMEOUT = int(os.getenv("VLLM_INACTIVITY_TIMEOUT", 1800))
 VLLM_CONTAINER_PREFIX = os.getenv("VLLM_CONTAINER_PREFIX", "vllm_server")
 NVIDIA_UTILITY_IMAGE = os.getenv("NVIDIA_UTILITY_IMAGE", "nvidia/cuda:12.1.0-base-ubuntu22.04")
-MEMORY_FOOTPRINT_FILE = os.getenv("MEMORY_FOOTPRINT_FILE", "/app/memory_footprints.json")
+MEMORY_FOOTPRINT_FILE = os.getenv("MEMORY_FOOTPRINT_FILE", "/app/data/memory_footprints.json")
 VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 
 # --- Model-specific vLLM Images ---
@@ -139,9 +139,19 @@ def load_known_footprints():
     global known_footprints
     try:
         if os.path.exists(MEMORY_FOOTPRINT_FILE):
+            if os.path.isdir(MEMORY_FOOTPRINT_FILE):
+                logging.error(f"MEMORY_FOOTPRINT_FILE '{MEMORY_FOOTPRINT_FILE}' is a directory, not a file!")
+                logging.error("This happens when Docker creates a missing mount target as a directory.")
+                logging.error("Fix: Stop container, run 'rm -rf {0} && echo \"{{}}\" > {0}' on host, then restart.".format(MEMORY_FOOTPRINT_FILE))
+                known_footprints = {}
+                return
             with open(MEMORY_FOOTPRINT_FILE, 'r') as f:
                 known_footprints = json.load(f)
             logging.info(f"Loaded known model footprints: {known_footprints}")
+        else:
+            logging.info(f"Memory footprints file not found, creating new one at {MEMORY_FOOTPRINT_FILE}")
+            known_footprints = {}
+            save_known_footprints()
     except (json.JSONDecodeError, IOError) as e:
         logging.error(f"Could not load memory footprints file: {e}")
         known_footprints = {}
@@ -149,6 +159,15 @@ def load_known_footprints():
 def save_known_footprints():
     """Saves the known footprints back to the JSON file."""
     try:
+        if os.path.isdir(MEMORY_FOOTPRINT_FILE):
+            logging.error(f"Cannot save footprints: '{MEMORY_FOOTPRINT_FILE}' is a directory, not a file!")
+            return
+
+        # Ensure parent directory exists
+        parent_dir = os.path.dirname(MEMORY_FOOTPRINT_FILE)
+        if parent_dir and not os.path.exists(parent_dir):
+            os.makedirs(parent_dir, exist_ok=True)
+
         with open(MEMORY_FOOTPRINT_FILE, 'w') as f:
             json.dump(known_footprints, f, indent=4)
     except IOError as e:

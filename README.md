@@ -86,8 +86,8 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount the Hugging Face cache to avoid re-downloading models.
       - /root/.cache/huggingface:/root/.cache/huggingface
-      # Mount a file to persist learned VRAM footprints. Must be a file, not a directory.
-      - ./memory_footprints.json:/app/memory_footprints.json
+      # Mount a data directory for persistent files (app creates files inside automatically).
+      - ./data:/app/data
     networks:
       - vllm_network
     restart: unless-stopped
@@ -153,14 +153,14 @@ The `.env` file will be automatically loaded by Docker Compose.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `HOST_CACHE_DIR` | `/root/.cache/huggingface` | HuggingFace cache directory on host |
-| `HOST_MEMORY_FOOTPRINT_FILE` | `./memory_footprints.json` | Memory footprints file on host |
+| `HOST_DATA_DIR` | `./data` | Data directory on host (app creates files inside) |
 | `HOST_TEMP_DIR` | `/tmp` | Temporary directory on host |
 
 #### Path Settings (Container)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `MEMORY_FOOTPRINT_FILE` | `/app/memory_footprints.json` | Memory footprints file inside gateway container |
+| `MEMORY_FOOTPRINT_FILE` | `/app/data/memory_footprints.json` | Memory footprints file inside gateway container |
 | `VLLM_TEMP_DIR` | `/tmp` | Temporary directory inside vLLM containers |
 
 #### Docker Images
@@ -205,14 +205,27 @@ The docker-compose.yml includes a default list of models that will be used if yo
 When deploying from GitHub using Portainer:
 
 1. **Stack Configuration**: In Portainer, create a new stack from the repository URL
-2. **Environment Variables**: Use the Portainer UI to set environment variables instead of editing files
-3. **Volumes**: Ensure paths like `HOST_CACHE_DIR` point to accessible host directories
-4. **Permissions**: Portainer must have access to `/var/run/docker.sock`
+
+2. **Environment Variables**: Use the Portainer UI to set environment variables
+
+3. **Data Directory**: The app uses a `./data` directory for persistent files
+   - Portainer will create this automatically when the stack starts
+   - No need to pre-create files - the app handles it
+
+4. **Optional - Custom Paths**: Override default paths if needed:
+   ```bash
+   HOST_DATA_DIR=/mnt/data/vllm-gateway
+   HOST_CACHE_DIR=/mnt/data/huggingface
+   ```
+
+5. **Permissions**: Portainer must have access to `/var/run/docker.sock`
 
 **Example Portainer Environment Variables:**
+
 ```bash
 HUGGING_FACE_HUB_TOKEN=hf_xxxxxxxxxxxxx
 HOST_CACHE_DIR=/mnt/data/huggingface
+HOST_DATA_DIR=/mnt/data/vllm-gateway
 LOG_LEVEL=INFO
 VLLM_INACTIVITY_TIMEOUT=3600
 
@@ -220,7 +233,37 @@ VLLM_INACTIVITY_TIMEOUT=3600
 ALLOWED_MODELS_JSON={"my-model":"org/model-repo","another-model":"org/another-repo"}
 ```
 
-**Note:** In Portainer's web UI, you can enter ALLOWED_MODELS_JSON in multi-line format for better readability.
+**Note:** In Portainer's web UI, you can enter `ALLOWED_MODELS_JSON` in multi-line format for better readability.
+
+## Troubleshooting
+
+### memory_footprints.json created as directory (legacy issue - now fixed)
+
+**Note:** As of the latest version, this issue is **resolved** by using directory mounts instead of file mounts.
+
+If you're running an older deployment where `memory_footprints.json` was created as a directory:
+
+**Fix:**
+
+```bash
+# SSH into your server
+ssh user@your-server
+
+# Stop the stack in Portainer
+# Then fix the directory issue
+cd /path/to/your/deployment
+rm -rf memory_footprints.json
+
+# Update your docker-compose.yml to use the new directory mount:
+# - ${HOST_DATA_DIR:-./data}:/app/data
+
+# Set environment variable:
+# MEMORY_FOOTPRINT_FILE=/app/data/memory_footprints.json
+
+# Start the stack again in Portainer
+```
+
+The application will now create the file automatically inside the mounted data directory.
 
 ## API Usage
 
