@@ -36,6 +36,10 @@ NVIDIA_UTILITY_IMAGE = os.getenv("NVIDIA_UTILITY_IMAGE", "nvidia/cuda:12.1.0-bas
 MEMORY_FOOTPRINT_FILE = os.getenv("MEMORY_FOOTPRINT_FILE", "/app/data/memory_footprints.json")
 VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 
+# Queue management configuration
+GATEWAY_MAX_QUEUE_SIZE = int(os.getenv("GATEWAY_MAX_QUEUE_SIZE", "200"))  # Max requests in queue per model
+GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max concurrent requests to vLLM per model
+
 # --- Model-specific vLLM Images ---
 # Placeholder for future per-model image customization
 MODEL_IMAGE_MAP = {}
@@ -57,6 +61,11 @@ active_containers = {}
 model_management_lock = asyncio.Lock()  # For updating active_containers dict
 container_start_locks = {}  # model_id -> asyncio.Lock for preventing concurrent container starts
 download_locks = {}  # model_id -> asyncio.Lock for preventing concurrent downloads
+
+# Queue management state
+model_semaphores = {}  # model_id -> asyncio.Semaphore for limiting concurrent requests
+model_queue_counts = {}  # model_id -> int (number of requests waiting in queue)
+queue_count_lock = asyncio.Lock()  # Protects queue counter updates
 
 @dataclass
 class ContainerState:
@@ -580,7 +589,15 @@ def gateway_status():
     return {
         "total_gpu_vram_mib": TOTAL_GPU_VRAM,
         "known_footprints_mib": known_footprints,
-        "active_containers": {name: state.__dict__ for name, state in active_containers.items()}
+        "active_containers": {name: state.__dict__ for name, state in active_containers.items()},
+        "queue_status": {
+            model_id: {
+                "queue_depth": model_queue_counts.get(model_id, 0),
+                "max_concurrent": GATEWAY_MAX_CONCURRENT,
+                "max_queue_size": GATEWAY_MAX_QUEUE_SIZE
+            }
+            for model_id in set(list(model_queue_counts.keys()) + [c.model_id for c in active_containers.values()])
+        }
     }
 
 # Catch-all proxy route (must be last)
@@ -602,194 +619,265 @@ async def proxy_request(request: Request):
 
     target_model_id = ALLOWED_MODELS[model_name]
 
-    # Quick check for existing container (no lock needed for read-only check)
-    target_container: ContainerState = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
-
-    if not target_container:
-        # Ensure per-model lock exists (protect lock creation with global lock)
+    # Initialize semaphore for this model if not exists
+    if target_model_id not in model_semaphores:
         async with model_management_lock:
-            if target_model_id not in container_start_locks:
-                container_start_locks[target_model_id] = asyncio.Lock()
-            per_model_lock = container_start_locks[target_model_id]
+            if target_model_id not in model_semaphores:
+                model_semaphores[target_model_id] = asyncio.Semaphore(GATEWAY_MAX_CONCURRENT)
+                model_queue_counts[target_model_id] = 0
 
-        # Acquire per-model lock to prevent concurrent starts of the same model
-        async with per_model_lock:
-            # Double-check after acquiring lock (another request may have started it)
-            target_container = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
+    # Check if queue is full and increment counter atomically
+    async with queue_count_lock:
+        current_queue_depth = model_queue_counts.get(target_model_id, 0)
+        if current_queue_depth >= GATEWAY_MAX_QUEUE_SIZE:
+            # Queue is full - reject request with 429 Too Many Requests
+            headers = {
+                "X-Queue-Depth": str(current_queue_depth),
+                "X-Queue-Max-Size": str(GATEWAY_MAX_QUEUE_SIZE),
+                "Retry-After": "30"  # Suggest retry after 30 seconds
+            }
+            return JSONResponse(
+                {
+                    "error": "Gateway queue is full",
+                    "details": f"Model {model_name} has {current_queue_depth} requests in queue (max: {GATEWAY_MAX_QUEUE_SIZE})",
+                    "queue_depth": current_queue_depth,
+                    "max_queue_size": GATEWAY_MAX_QUEUE_SIZE,
+                    "retry_after_seconds": 30
+                },
+                status_code=429,
+                headers=headers
+            )
+
+        # Increment queue counter atomically
+        model_queue_counts[target_model_id] = current_queue_depth + 1
+
+    # Track whether we've decremented the counter (for exception handling)
+    counter_decremented = False
+
+    try:
+        # Acquire semaphore slot (wait in queue if necessary)
+        async with model_semaphores[target_model_id]:
+            # Decrement queue counter now that we have a semaphore slot
+            async with queue_count_lock:
+                model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
+                counter_decremented = True
+
+            # Quick check for existing container (no lock needed for read-only check)
+            target_container: ContainerState = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
 
             if not target_container:
-                # 2. Model not running, need to start it
-                footprint = known_footprints.get(target_model_id)
+                # Ensure per-model lock exists (protect lock creation with global lock)
+                async with model_management_lock:
+                    if target_model_id not in container_start_locks:
+                        container_start_locks[target_model_id] = asyncio.Lock()
+                    per_model_lock = container_start_locks[target_model_id]
 
-                if footprint is None and TOTAL_GPU_VRAM > 0:
-                    # DISCOVERY RUN
-                    logging.info(f"Unknown footprint for {target_model_id}. Starting a discovery run.")
+                # Acquire per-model lock to prevent concurrent starts of the same model
+                async with per_model_lock:
+                    # Double-check after acquiring lock (another request may have started it)
+                    target_container = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
 
-                    # Check and stop containers with lock
-                    async with model_management_lock:
-                        if active_containers:
-                            logging.info("Stopping all active containers for discovery run.")
-                            container_names_to_stop = list(active_containers.keys())
-                        else:
-                            container_names_to_stop = []
+                    if not target_container:
+                        # 2. Model not running, need to start it
+                        footprint = known_footprints.get(target_model_id)
 
-                    # Stop containers outside lock (I/O operation)
-                    for name in container_names_to_stop:
-                        await stop_container(name)
+                        if footprint is None and TOTAL_GPU_VRAM > 0:
+                            # DISCOVERY RUN
+                            logging.info(f"Unknown footprint for {target_model_id}. Starting a discovery run.")
 
-                    vram_before = get_used_vram()
-                    logging.info(f"VRAM usage before model load: {vram_before} MiB")
+                            # Check and stop containers with lock
+                            async with model_management_lock:
+                                if active_containers:
+                                    logging.info("Stopping all active containers for discovery run.")
+                                    container_names_to_stop = list(active_containers.keys())
+                                else:
+                                    container_names_to_stop = []
 
-                    container_name = f"{VLLM_CONTAINER_PREFIX}_0"
-                    # Start container outside lock (long I/O operation)
-                    target_container = await start_model_container(target_model_id, container_name)
+                            # Stop containers outside lock (I/O operation)
+                            for name in container_names_to_stop:
+                                await stop_container(name)
 
-                    if target_container:
-                        # Wait for model to fully load into VRAM and take multiple measurements
-                        logging.info("Waiting for model to fully load into VRAM (taking 3 measurements over 45 seconds)...")
-                        await asyncio.sleep(15)
-                        vram_samples = [get_used_vram()]
+                            vram_before = get_used_vram()
+                            logging.info(f"VRAM usage before model load: {vram_before} MiB")
 
-                        await asyncio.sleep(15)
-                        vram_samples.append(get_used_vram())
+                            container_name = f"{VLLM_CONTAINER_PREFIX}_0"
+                            # Start container outside lock (long I/O operation)
+                            target_container = await start_model_container(target_model_id, container_name)
 
-                        await asyncio.sleep(15)
-                        vram_samples.append(get_used_vram())
+                            if target_container:
+                                # Wait for model to fully load into VRAM and take multiple measurements
+                                logging.info("Waiting for model to fully load into VRAM (taking 3 measurements over 45 seconds)...")
+                                await asyncio.sleep(15)
+                                vram_samples = [get_used_vram()]
 
-                        # Use maximum VRAM measurement to ensure we capture full footprint
-                        vram_after = max(vram_samples)
-                        logging.info(f"VRAM samples: {vram_samples} MiB, using max: {vram_after} MiB")
+                                await asyncio.sleep(15)
+                                vram_samples.append(get_used_vram())
 
-                        measured_vram = vram_after - vram_before
+                                await asyncio.sleep(15)
+                                vram_samples.append(get_used_vram())
 
-                        if measured_vram > 256: # Sanity check for a reasonable footprint
-                            logging.info(f"Measured VRAM footprint for {target_model_id}: {measured_vram} MiB")
-                            target_container.vram_footprint = measured_vram
-                            known_footprints[target_model_id] = measured_vram
-                            save_known_footprints()
-                        else:
-                            logging.warning(f"Could not measure accurate footprint for {target_model_id} (calculated {measured_vram} MiB). Using container without VRAM management.")
-                            target_container.vram_footprint = 0  # Mark as unknown
+                                # Use maximum VRAM measurement to ensure we capture full footprint
+                                vram_after = max(vram_samples)
+                                logging.info(f"VRAM samples: {vram_samples} MiB, using max: {vram_after} MiB")
 
-                        # Update active_containers with lock
-                        async with model_management_lock:
-                            active_containers[container_name] = target_container
+                                measured_vram = vram_after - vram_before
 
+                                if measured_vram > 256: # Sanity check for a reasonable footprint
+                                    logging.info(f"Measured VRAM footprint for {target_model_id}: {measured_vram} MiB")
+                                    target_container.vram_footprint = measured_vram
+                                    known_footprints[target_model_id] = measured_vram
+                                    save_known_footprints()
+                                else:
+                                    logging.warning(f"Could not measure accurate footprint for {target_model_id} (calculated {measured_vram} MiB). Using container without VRAM management.")
+                                    target_container.vram_footprint = 0  # Mark as unknown
 
-                elif TOTAL_GPU_VRAM > 0:
-                    # KNOWN FOOTPRINT RUN
-                    # Calculate VRAM and determine evictions with lock
-                    async with model_management_lock:
-                        current_vram_usage = sum(c.vram_footprint for c in active_containers.values())
-                        containers_to_evict = []
-
-                        if current_vram_usage + footprint > TOTAL_GPU_VRAM:
-                            logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). Evicting LRU containers.")
-                            # Determine which containers to evict
-                            sorted_containers = sorted(active_containers.values(), key=lambda c: c.last_request_time)
-                            for container_to_evict in sorted_containers:
-                                containers_to_evict.append(container_to_evict.container_name)
-                                current_vram_usage -= container_to_evict.vram_footprint
-                                if current_vram_usage + footprint <= TOTAL_GPU_VRAM:
-                                    break
-
-                        # Find a free slot index
-                        slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
-                        free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
-                        container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
-
-                    # Evict containers outside lock (I/O operation)
-                    for name in containers_to_evict:
-                        await stop_container(name)
-
-                    # Start container outside lock (long I/O operation)
-                    target_container = await start_model_container(target_model_id, container_name)
-                    if target_container:
-                        target_container.vram_footprint = footprint
-                        # Update active_containers with lock
-                        async with model_management_lock:
-                            active_containers[container_name] = target_container
+                                # Update active_containers with lock
+                                async with model_management_lock:
+                                    active_containers[container_name] = target_container
 
 
-                else: # Fallback if VRAM management is disabled
-                    # Without VRAM management, only run one container at a time
-                    # Stop all existing containers to prevent name conflicts
-                    async with model_management_lock:
-                        if active_containers:
-                            logging.info(f"No dynamic VRAM management. Stopping all {len(active_containers)} active containers.")
-                            container_names_to_stop = list(active_containers.keys())
-                        else:
-                            container_names_to_stop = []
+                        elif TOTAL_GPU_VRAM > 0:
+                            # KNOWN FOOTPRINT RUN
+                            # Calculate VRAM and determine evictions with lock
+                            async with model_management_lock:
+                                current_vram_usage = sum(c.vram_footprint for c in active_containers.values())
+                                containers_to_evict = []
 
-                    # Evict all containers outside lock (I/O operation)
-                    for name in container_names_to_stop:
-                        await stop_container(name)
+                                if current_vram_usage + footprint > TOTAL_GPU_VRAM:
+                                    logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). Evicting LRU containers.")
+                                    # Determine which containers to evict
+                                    sorted_containers = sorted(active_containers.values(), key=lambda c: c.last_request_time)
+                                    for container_to_evict in sorted_containers:
+                                        containers_to_evict.append(container_to_evict.container_name)
+                                        current_vram_usage -= container_to_evict.vram_footprint
+                                        if current_vram_usage + footprint <= TOTAL_GPU_VRAM:
+                                            break
 
-                    container_name = f"{VLLM_CONTAINER_PREFIX}_0"
-                    # Start container outside lock (long I/O operation)
-                    target_container = await start_model_container(target_model_id, container_name)
-                    if target_container:
-                        # Update active_containers with lock
-                        async with model_management_lock:
-                            active_containers[container_name] = target_container
+                                # Find a free slot index
+                                slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
+                                free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
+                                container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
 
-    # Outside all locks - check if we have a container
-    if not target_container:
-        raise HTTPException(status_code=500, detail=f"Failed to start or find container for model {target_model_id}")
+                            # Evict containers outside lock (I/O operation)
+                            for name in containers_to_evict:
+                                await stop_container(name)
 
-    # Update last request time (no lock needed - single attribute write)
-    target_container.last_request_time = time.time()
+                            # Start container outside lock (long I/O operation)
+                            target_container = await start_model_container(target_model_id, container_name)
+                            if target_container:
+                                target_container.vram_footprint = footprint
+                                # Update active_containers with lock
+                                async with model_management_lock:
+                                    active_containers[container_name] = target_container
 
-    # Build full URL with query parameters
-    query_string = str(request.url.query) if request.url.query else ""
-    vllm_url = f"http://{target_container.ip_address}:{target_container.port}{request.url.path}"
-    if query_string:
-        vllm_url += f"?{query_string}"
 
-    # Request proxying happens outside all locks
-    try:
-        # Update model field in body before proxying
-        body['model'] = target_model_id
+                        else: # Fallback if VRAM management is disabled
+                            # Without VRAM management, only run one container at a time
+                            # Stop all existing containers to prevent name conflicts
+                            async with model_management_lock:
+                                if active_containers:
+                                    logging.info(f"No dynamic VRAM management. Stopping all {len(active_containers)} active containers.")
+                                    container_names_to_stop = list(active_containers.keys())
+                                else:
+                                    container_names_to_stop = []
 
-        # Forward relevant headers (exclude hop-by-hop headers)
-        headers_to_forward = {
-            k: v for k, v in request.headers.items()
-            if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding')
-        }
+                            # Evict all containers outside lock (I/O operation)
+                            for name in container_names_to_stop:
+                                await stop_container(name)
 
-        # Check if this is a streaming request
-        is_streaming = body.get('stream', False)
+                            container_name = f"{VLLM_CONTAINER_PREFIX}_0"
+                            # Start container outside lock (long I/O operation)
+                            target_container = await start_model_container(target_model_id, container_name)
+                            if target_container:
+                                # Update active_containers with lock
+                                async with model_management_lock:
+                                    active_containers[container_name] = target_container
 
-        # Proxy request using the original HTTP method
-        response = await http_client.request(
-            method=request.method,
-            url=vllm_url,
-            json=body,
-            headers=headers_to_forward,
-            timeout=300
-        )
-        response.raise_for_status()
+            # Outside all locks - check if we have a container
+            if not target_container:
+                raise HTTPException(status_code=500, detail=f"Failed to start or find container for model {target_model_id}")
 
-        # Handle streaming vs non-streaming responses
-        if is_streaming:
-            # For streaming responses, return the raw content with appropriate headers
-            from fastapi.responses import StreamingResponse
+            # Update last request time (no lock needed - single attribute write)
+            target_container.last_request_time = time.time()
 
-            async def generate():
-                async for chunk in response.aiter_bytes():
-                    yield chunk
+            # Build full URL with query parameters
+            query_string = str(request.url.query) if request.url.query else ""
+            vllm_url = f"http://{target_container.ip_address}:{target_container.port}{request.url.path}"
+            if query_string:
+                vllm_url += f"?{query_string}"
 
-            return StreamingResponse(
-                generate(),
-                status_code=response.status_code,
-                media_type=response.headers.get('content-type', 'text/event-stream'),
-                headers={k: v for k, v in response.headers.items()
-                        if k.lower() not in ('content-length', 'transfer-encoding', 'connection')}
-            )
-        else:
-            # For non-streaming responses, return JSON as before
-            return JSONResponse(content=response.json(), status_code=response.status_code)
-    except httpx.HTTPStatusError as e:
-        return JSONResponse({"error": "Error from vLLM service", "details": str(e)}, status_code=e.response.status_code)
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
+            # Get current queue depth for headers
+            current_queue_depth = model_queue_counts.get(target_model_id, 0)
+
+            # Request proxying happens outside all locks
+            try:
+                # Update model field in body before proxying
+                body['model'] = target_model_id
+
+                # Forward relevant headers (exclude hop-by-hop headers)
+                headers_to_forward = {
+                    k: v for k, v in request.headers.items()
+                    if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding')
+                }
+
+                # Check if this is a streaming request
+                is_streaming = body.get('stream', False)
+
+                # Proxy request using the original HTTP method
+                response = await http_client.request(
+                    method=request.method,
+                    url=vllm_url,
+                    json=body,
+                    headers=headers_to_forward,
+                    timeout=300
+                )
+                response.raise_for_status()
+
+                # Add queue status headers to response
+                queue_headers = {
+                    "X-Queue-Depth": str(current_queue_depth),
+                    "X-Max-Concurrent": str(GATEWAY_MAX_CONCURRENT),
+                    "X-Max-Queue-Size": str(GATEWAY_MAX_QUEUE_SIZE)
+                }
+
+                # Handle streaming vs non-streaming responses
+                if is_streaming:
+                    # For streaming responses, return the raw content with appropriate headers
+                    from fastapi.responses import StreamingResponse
+
+                    async def generate():
+                        async for chunk in response.aiter_bytes():
+                            yield chunk
+
+                    response_headers = {k: v for k, v in response.headers.items()
+                            if k.lower() not in ('content-length', 'transfer-encoding', 'connection')}
+                    response_headers.update(queue_headers)
+
+                    return StreamingResponse(
+                        generate(),
+                        status_code=response.status_code,
+                        media_type=response.headers.get('content-type', 'text/event-stream'),
+                        headers=response_headers
+                    )
+                else:
+                    # For non-streaming responses, return JSON as before
+                    return JSONResponse(
+                        content=response.json(),
+                        status_code=response.status_code,
+                        headers=queue_headers
+                    )
+            except httpx.HTTPStatusError as e:
+                return JSONResponse(
+                    {"error": "Error from vLLM service", "details": str(e)},
+                    status_code=e.response.status_code,
+                    headers={"X-Queue-Depth": str(current_queue_depth)}
+                )
+            except httpx.RequestError as e:
+                raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
+    except Exception:
+        # If an exception occurs BEFORE counter was decremented (line 662),
+        # we need to decrement it now to avoid leaking the counter
+        if not counter_decremented:
+            async with queue_count_lock:
+                model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
+        raise
