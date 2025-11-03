@@ -5,3 +5,4 @@ my-vlmm-gateway.tar
 *.mdb
 data/
 memory_footprints.json
+cheatsheet*
