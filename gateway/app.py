@@ -40,6 +40,20 @@ VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 GATEWAY_MAX_QUEUE_SIZE = int(os.getenv("GATEWAY_MAX_QUEUE_SIZE", "200"))  # Max requests in queue per model
 GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max concurrent requests to vLLM per model
 
+# Validate critical configuration values
+def validate_config():
+    """Validates configuration values to prevent system failures."""
+    if GATEWAY_MAX_QUEUE_SIZE <= 0:
+        raise ValueError(f"GATEWAY_MAX_QUEUE_SIZE must be > 0, got {GATEWAY_MAX_QUEUE_SIZE}")
+    if GATEWAY_MAX_CONCURRENT <= 0:
+        raise ValueError(f"GATEWAY_MAX_CONCURRENT must be > 0, got {GATEWAY_MAX_CONCURRENT}")
+    if GATEWAY_MAX_QUEUE_SIZE > 10000:
+        logging.warning(f"GATEWAY_MAX_QUEUE_SIZE is very large ({GATEWAY_MAX_QUEUE_SIZE}). This may cause memory issues.")
+    if GATEWAY_MAX_CONCURRENT > 500:
+        logging.warning(f"GATEWAY_MAX_CONCURRENT is very large ({GATEWAY_MAX_CONCURRENT}). This may overwhelm vLLM.")
+
+validate_config()
+
 # --- Model-specific vLLM Images ---
 # Placeholder for future per-model image customization
 MODEL_IMAGE_MAP = {}
@@ -78,7 +92,29 @@ class ContainerState:
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
-http_client = httpx.AsyncClient()
+
+# Configure HTTP client with appropriate connection limits for high concurrency
+# Connection pool must accommodate multiple concurrent models
+# Formula: GATEWAY_MAX_CONCURRENT * expected number of concurrent models + buffer
+# Default sizing: 50 concurrent * 3 models = 150 connections minimum
+GATEWAY_MAX_MODELS_CONCURRENT = int(os.getenv("GATEWAY_MAX_MODELS_CONCURRENT", "3"))
+
+# Validate HTTP pool configuration
+if GATEWAY_MAX_MODELS_CONCURRENT <= 0:
+    raise ValueError(f"GATEWAY_MAX_MODELS_CONCURRENT must be > 0, got {GATEWAY_MAX_MODELS_CONCURRENT}")
+if GATEWAY_MAX_MODELS_CONCURRENT > 20:
+    logging.warning(f"GATEWAY_MAX_MODELS_CONCURRENT is very large ({GATEWAY_MAX_MODELS_CONCURRENT}). Connection pool will be {GATEWAY_MAX_CONCURRENT * GATEWAY_MAX_MODELS_CONCURRENT} connections.")
+
+http_pool_size = GATEWAY_MAX_CONCURRENT * GATEWAY_MAX_MODELS_CONCURRENT
+http_keepalive_size = http_pool_size  # Keep all connections alive for best performance
+
+http_client = httpx.AsyncClient(
+    limits=httpx.Limits(
+        max_connections=http_pool_size,  # 150 by default (50 * 3)
+        max_keepalive_connections=http_keepalive_size,  # 150 by default (matches pool size)
+    ),
+    timeout=httpx.Timeout(300.0, connect=10.0)  # 10s connect timeout, 300s total timeout
+)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
@@ -631,6 +667,7 @@ async def proxy_request(request: Request):
         current_queue_depth = model_queue_counts.get(target_model_id, 0)
         if current_queue_depth >= GATEWAY_MAX_QUEUE_SIZE:
             # Queue is full - reject request with 429 Too Many Requests
+            logging.warning(f"Queue full for {model_name} ({target_model_id}). Rejecting request. Queue depth: {current_queue_depth}/{GATEWAY_MAX_QUEUE_SIZE}")
             headers = {
                 "X-Queue-Depth": str(current_queue_depth),
                 "X-Queue-Max-Size": str(GATEWAY_MAX_QUEUE_SIZE),
@@ -650,17 +687,22 @@ async def proxy_request(request: Request):
 
         # Increment queue counter atomically
         model_queue_counts[target_model_id] = current_queue_depth + 1
+        logging.debug(f"Request queued for {model_name} ({target_model_id}). Queue depth: {current_queue_depth + 1}/{GATEWAY_MAX_QUEUE_SIZE}")
 
-    # Track whether we've decremented the counter (for exception handling)
-    counter_decremented = False
+    # Track whether we need to decrement counter in exception handler
+    # We track the INCREMENT (which always happens), not the decrement (which may fail)
+    counter_needs_cleanup = True
 
     try:
         # Acquire semaphore slot (wait in queue if necessary)
         async with model_semaphores[target_model_id]:
             # Decrement queue counter now that we have a semaphore slot
+            # CRITICAL: Mark cleanup flag BEFORE decrement to prevent double-decrement
+            # if logging.debug() fails after decrement but before flag is set
             async with queue_count_lock:
+                counter_needs_cleanup = False  # Set flag FIRST
                 model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
-                counter_decremented = True
+                logging.debug(f"Request dequeued for {model_name} ({target_model_id}). Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
 
             # Quick check for existing container (no lock needed for read-only check)
             target_container: ContainerState = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
@@ -823,15 +865,34 @@ async def proxy_request(request: Request):
                 # Check if this is a streaming request
                 is_streaming = body.get('stream', False)
 
-                # Proxy request using the original HTTP method
-                response = await http_client.request(
-                    method=request.method,
-                    url=vllm_url,
-                    json=body,
-                    headers=headers_to_forward,
-                    timeout=300
-                )
-                response.raise_for_status()
+                # Retry logic for transient connection failures
+                # Only retries connection errors (ConnectError, ConnectTimeout, PoolTimeout)
+                # HTTP errors (4xx, 5xx) are not retried as they're not transient
+                max_retries = 3
+                retry_delay = 1.0  # seconds
+
+                for retry_attempt in range(max_retries):
+                    try:
+                        # Proxy request using the original HTTP method
+                        response = await http_client.request(
+                            method=request.method,
+                            url=vllm_url,
+                            json=body,
+                            headers=headers_to_forward,
+                            timeout=300
+                        )
+                        response.raise_for_status()
+                        break  # Success - exit retry loop
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                        # Connection error - may be transient, retry if attempts remain
+                        if retry_attempt < max_retries - 1:
+                            logging.warning(f"Transient connection error to vLLM for {model_name} (attempt {retry_attempt + 1}/{max_retries}): {type(e).__name__}. Retrying in {retry_delay}s...")
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 1.5  # Exponential backoff
+                        else:
+                            # Final attempt failed - log and re-raise
+                            logging.error(f"Failed to connect to vLLM for {model_name} after {max_retries} attempts: {type(e).__name__}: {str(e)}")
+                            raise  # Re-raise to trigger httpx.RequestError handler below
 
                 # Add queue status headers to response
                 queue_headers = {
@@ -867,17 +928,27 @@ async def proxy_request(request: Request):
                         headers=queue_headers
                     )
             except httpx.HTTPStatusError as e:
+                logging.error(f"vLLM returned HTTP error for {model_name} ({target_model_id}): {e.response.status_code} - {str(e)}")
                 return JSONResponse(
                     {"error": "Error from vLLM service", "details": str(e)},
                     status_code=e.response.status_code,
                     headers={"X-Queue-Depth": str(current_queue_depth)}
                 )
             except httpx.RequestError as e:
+                logging.error(f"Connection error to vLLM for {model_name} ({target_model_id}) at {vllm_url}: {type(e).__name__}: {str(e)}")
                 raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
     except Exception:
-        # If an exception occurs BEFORE counter was decremented (line 662),
-        # we need to decrement it now to avoid leaking the counter
-        if not counter_decremented:
+        # Exception cleanup: If the counter was incremented but never decremented
+        # (because exception occurred before or during the decrement operation),
+        # we need to decrement it here to avoid leaking the queue counter.
+        # This handles cases like:
+        # - Semaphore acquisition cancelled (asyncio.CancelledError)
+        # - Exception before semaphore acquired
+        # - Exception during decrement operation (between line 700-704)
+        # - Container start failures
+        # - HTTP request failures
+        if counter_needs_cleanup:
             async with queue_count_lock:
                 model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
+                logging.debug(f"Exception cleanup: decremented queue counter for {model_name} ({target_model_id}). Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
         raise
