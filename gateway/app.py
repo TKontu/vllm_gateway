@@ -40,6 +40,10 @@ VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 GATEWAY_MAX_QUEUE_SIZE = int(os.getenv("GATEWAY_MAX_QUEUE_SIZE", "200"))  # Max requests in queue per model
 GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max concurrent requests to vLLM per model
 
+# Timeout configuration (in seconds)
+GATEWAY_REQUEST_TIMEOUT = int(os.getenv("GATEWAY_REQUEST_TIMEOUT", "300"))  # Total request timeout (default 5 minutes)
+GATEWAY_CONNECT_TIMEOUT = int(os.getenv("GATEWAY_CONNECT_TIMEOUT", "10"))  # Connection establishment timeout
+
 # Validate critical configuration values
 def validate_config():
     """Validates configuration values to prevent system failures."""
@@ -47,10 +51,19 @@ def validate_config():
         raise ValueError(f"GATEWAY_MAX_QUEUE_SIZE must be > 0, got {GATEWAY_MAX_QUEUE_SIZE}")
     if GATEWAY_MAX_CONCURRENT <= 0:
         raise ValueError(f"GATEWAY_MAX_CONCURRENT must be > 0, got {GATEWAY_MAX_CONCURRENT}")
+    if GATEWAY_REQUEST_TIMEOUT <= 0:
+        raise ValueError(f"GATEWAY_REQUEST_TIMEOUT must be > 0, got {GATEWAY_REQUEST_TIMEOUT}")
+    if GATEWAY_CONNECT_TIMEOUT <= 0:
+        raise ValueError(f"GATEWAY_CONNECT_TIMEOUT must be > 0, got {GATEWAY_CONNECT_TIMEOUT}")
+
     if GATEWAY_MAX_QUEUE_SIZE > 10000:
         logging.warning(f"GATEWAY_MAX_QUEUE_SIZE is very large ({GATEWAY_MAX_QUEUE_SIZE}). This may cause memory issues.")
     if GATEWAY_MAX_CONCURRENT > 500:
         logging.warning(f"GATEWAY_MAX_CONCURRENT is very large ({GATEWAY_MAX_CONCURRENT}). This may overwhelm vLLM.")
+    if GATEWAY_REQUEST_TIMEOUT > 3600:
+        logging.warning(f"GATEWAY_REQUEST_TIMEOUT is very large ({GATEWAY_REQUEST_TIMEOUT}s = {GATEWAY_REQUEST_TIMEOUT//60} minutes). Consider if this is intentional.")
+    if GATEWAY_CONNECT_TIMEOUT > 60:
+        logging.warning(f"GATEWAY_CONNECT_TIMEOUT is very large ({GATEWAY_CONNECT_TIMEOUT}s). Connection should establish quickly.")
 
 validate_config()
 
@@ -113,7 +126,10 @@ http_client = httpx.AsyncClient(
         max_connections=http_pool_size,  # 150 by default (50 * 3)
         max_keepalive_connections=http_keepalive_size,  # 150 by default (matches pool size)
     ),
-    timeout=httpx.Timeout(300.0, connect=10.0)  # 10s connect timeout, 300s total timeout
+    timeout=httpx.Timeout(
+        timeout=float(GATEWAY_REQUEST_TIMEOUT),  # Total request timeout (configurable)
+        connect=float(GATEWAY_CONNECT_TIMEOUT)    # Connection timeout (configurable)
+    )
 )
 
 @asynccontextmanager
@@ -874,12 +890,12 @@ async def proxy_request(request: Request):
                 for retry_attempt in range(max_retries):
                     try:
                         # Proxy request using the original HTTP method
+                        # Uses timeout configured in http_client (GATEWAY_REQUEST_TIMEOUT)
                         response = await http_client.request(
                             method=request.method,
                             url=vllm_url,
                             json=body,
-                            headers=headers_to_forward,
-                            timeout=300
+                            headers=headers_to_forward
                         )
                         response.raise_for_status()
                         break  # Success - exit retry loop
