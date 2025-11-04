@@ -43,8 +43,8 @@ services:
       GATEWAY_MAX_MODELS_CONCURRENT: ${GATEWAY_MAX_MODELS_CONCURRENT:-3}
 
       # --- GATEWAY TIMEOUT CONFIGURATION ---
-      GATEWAY_REQUEST_TIMEOUT: ${GATEWAY_REQUEST_TIMEOUT:-600}  # Total request timeout in seconds (default 5 min)
-      GATEWAY_CONNECT_TIMEOUT: ${GATEWAY_CONNECT_TIMEOUT:-30}   # Connection timeout in seconds
+      GATEWAY_REQUEST_TIMEOUT: ${GATEWAY_REQUEST_TIMEOUT:-1200}  # Total request timeout in seconds (default 20 min)
+      GATEWAY_CONNECT_TIMEOUT: ${GATEWAY_CONNECT_TIMEOUT:-60}   # Connection timeout in seconds
 
       # --- CONFIGURABLE ALLOWED MODELS ---
       # Override with your own JSON in .env file or Portainer

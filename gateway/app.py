@@ -67,6 +67,13 @@ def validate_config():
 
 validate_config()
 
+# Log startup configuration for debugging
+logging.info("=" * 60)
+logging.info("GATEWAY TIMEOUT CONFIGURATION:")
+logging.info(f"  GATEWAY_REQUEST_TIMEOUT: {GATEWAY_REQUEST_TIMEOUT}s ({GATEWAY_REQUEST_TIMEOUT//60} minutes)")
+logging.info(f"  GATEWAY_CONNECT_TIMEOUT: {GATEWAY_CONNECT_TIMEOUT}s")
+logging.info("=" * 60)
+
 # --- Model-specific vLLM Images ---
 # Placeholder for future per-model image customization
 MODEL_IMAGE_MAP = {}
