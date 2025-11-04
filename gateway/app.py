@@ -127,8 +127,10 @@ http_client = httpx.AsyncClient(
         max_keepalive_connections=http_keepalive_size,  # 150 by default (matches pool size)
     ),
     timeout=httpx.Timeout(
-        timeout=float(GATEWAY_REQUEST_TIMEOUT),  # Total request timeout (configurable)
-        connect=float(GATEWAY_CONNECT_TIMEOUT)    # Connection timeout (configurable)
+        connect=float(GATEWAY_CONNECT_TIMEOUT),   # Connection timeout (configurable)
+        read=float(GATEWAY_REQUEST_TIMEOUT),      # Read timeout for response headers/body
+        write=float(GATEWAY_REQUEST_TIMEOUT),     # Write timeout for sending request body
+        pool=float(GATEWAY_CONNECT_TIMEOUT)       # Pool timeout for acquiring connection
     )
 )
 
