@@ -28,6 +28,7 @@ VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16")
 VLLM_MAX_MODEL_LEN_GLOBAL = int(os.getenv("VLLM_MAX_MODEL_LEN_GLOBAL", "0"))
 VLLM_MAX_NUM_SEQS = os.getenv("VLLM_MAX_NUM_SEQS", "16")
 VLLM_TENSOR_PARALLEL_SIZE = os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")
+VLLM_ENFORCE_EAGER = os.getenv("VLLM_ENFORCE_EAGER", "false").lower() == "true"
 DOCKER_NETWORK_NAME = os.getenv("DOCKER_NETWORK_NAME", "vllm_network")
 GATEWAY_CONTAINER_NAME = os.getenv("GATEWAY_CONTAINER_NAME", "vllm_gateway")
 VLLM_INACTIVITY_TIMEOUT = int(os.getenv("VLLM_INACTIVITY_TIMEOUT", 1800))
@@ -521,9 +522,11 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             actual_model_path, tokenizer_repo = await download_gguf_from_repo(model_id)
             logging.info(f"Will use local GGUF path: {actual_model_path}")
 
-    model_max_len = await get_model_max_len(tokenizer_repo if tokenizer_repo else model_id)
-    final_max_len = model_max_len
+    # Only fetch and set max_model_len when the user has configured a global cap.
+    # When no cap is set (0), let vLLM auto-detect the correct value for the model.
+    final_max_len = 0
     if VLLM_MAX_MODEL_LEN_GLOBAL > 0:
+        model_max_len = await get_model_max_len(tokenizer_repo if tokenizer_repo else model_id)
         final_max_len = min(model_max_len, VLLM_MAX_MODEL_LEN_GLOBAL) if model_max_len > 0 else VLLM_MAX_MODEL_LEN_GLOBAL
 
     command = ["--model", actual_model_path, "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION]
@@ -559,6 +562,9 @@ async def start_model_container(model_id: str, container_name: str) -> Container
     if is_gpt_oss_model(model_id):
         command.append("--async-scheduling")
         logging.info(f"Added --async-scheduling flag for gpt-oss model optimization")
+
+    if VLLM_ENFORCE_EAGER:
+        command.append("--enforce-eager")
 
     try:
         vllm_image = get_vllm_image_for_model(model_id)
