@@ -5,6 +5,7 @@ import docker
 import json
 import time
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from functools import partial
 from fastapi import FastAPI, Request, HTTPException
@@ -579,7 +580,9 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             network=RESOLVED_DOCKER_NETWORK,
             environment={
                 "HUGGING_FACE_HUB_TOKEN": HF_TOKEN,
-                "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1"
+                "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
+                "VLLM_NO_CUDAGRAPH": "1",
+                "VLLM_CACHE_BUST": str(uuid.uuid4()),
             },
             ipc_mode="host",
             device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])],
