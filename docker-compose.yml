@@ -48,6 +48,7 @@ services:
 
       # --- VLLM ENGINE OPTIONS ---
       VLLM_ENFORCE_EAGER: ${VLLM_ENFORCE_EAGER:-false}
+      VLLM_NO_CUDAGRAPH: ${VLLM_NO_CUDAGRAPH:-false}
 
       # --- CONFIGURABLE ALLOWED MODELS ---
       # Override with your own JSON in .env file or Portainer

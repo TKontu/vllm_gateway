@@ -30,6 +30,7 @@ VLLM_MAX_MODEL_LEN_GLOBAL = int(os.getenv("VLLM_MAX_MODEL_LEN_GLOBAL", "0"))
 VLLM_MAX_NUM_SEQS = os.getenv("VLLM_MAX_NUM_SEQS", "16")
 VLLM_TENSOR_PARALLEL_SIZE = os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")
 VLLM_ENFORCE_EAGER = os.getenv("VLLM_ENFORCE_EAGER", "false").lower() == "true"
+VLLM_NO_CUDAGRAPH = os.getenv("VLLM_NO_CUDAGRAPH", "false").lower() == "true"
 DOCKER_NETWORK_NAME = os.getenv("DOCKER_NETWORK_NAME", "vllm_network")
 GATEWAY_CONTAINER_NAME = os.getenv("GATEWAY_CONTAINER_NAME", "vllm_gateway")
 VLLM_INACTIVITY_TIMEOUT = int(os.getenv("VLLM_INACTIVITY_TIMEOUT", 1800))
@@ -581,7 +582,7 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             environment={
                 "HUGGING_FACE_HUB_TOKEN": HF_TOKEN,
                 "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
-                "VLLM_NO_CUDAGRAPH": "1",
+                **({"VLLM_NO_CUDAGRAPH": "1"} if VLLM_NO_CUDAGRAPH else {}),
                 "VLLM_CACHE_BUST": str(uuid.uuid4()),
             },
             ipc_mode="host",
