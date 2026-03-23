@@ -22,6 +22,7 @@ logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(levelname)s - %(mes
 # --- Configuration ---
 HF_TOKEN = os.getenv("HUGGING_FACE_HUB_TOKEN", "")
 HOST_CACHE_DIR = os.getenv("HOST_CACHE_DIR", "/root/.cache/huggingface")
+CONTAINER_CACHE_MOUNT = '/root/.cache/huggingface'  # Where HOST_CACHE_DIR is mounted inside vLLM containers
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_IMAGE = os.getenv("VLLM_IMAGE", "vllm/vllm-openai:v0.10.2")
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
@@ -273,17 +274,22 @@ def extract_tokenizer_from_gguf_path(model_path: str) -> str:
                 if len(parts) >= 2:
                     return f"{parts[0]}/{parts[1]}"
         elif '/' in model_path:
-            # For repo_id/filename.gguf format, use the repo_id as tokenizer
+            # For repo_id/filename.gguf format, use the repo_id as tokenizer.
+            # Only valid if the prefix is itself a 2-part HF repo ID (org/repo).
             repo_id = model_path.rsplit('/', 1)[0]
-            return repo_id
+            if '/' in repo_id:
+                return repo_id
     return ""
 
 def is_gguf_repo(model_id: str) -> bool:
     """Check if model_id is a HuggingFace repo containing GGUF files (not a local path)."""
-    # Format: org/repo or user/repo, contains -gguf or -GGUF in the repo name
+    # Format: org/repo or user/repo, contains -gguf or -GGUF in the repo name.
+    # Exclude vLLM's native repo:quant_type format (e.g. unsloth/Qwen3-0.6B-GGUF:Q4_K_M)
+    # which contains a colon — vLLM handles that format natively without downloading.
     return ('/' in model_id and
             not model_id.startswith('/') and
             not model_id.endswith('.gguf') and
+            ':' not in model_id and
             ('-gguf' in model_id.lower() or 'gguf' in model_id.lower()))
 
 def infer_base_model_from_gguf_repo(gguf_repo_id: str) -> str:
@@ -445,6 +451,17 @@ async def stop_container(container_name: str):
         if container_name in active_containers:
             del active_containers[container_name]
 
+async def hf_repo_exists(repo_id: str) -> bool:
+    """Return True if repo_id has a readable config.json on HuggingFace."""
+    if not repo_id:
+        return False
+    url = f"https://huggingface.co/{repo_id}/raw/main/config.json"
+    try:
+        resp = await http_client.get(url, timeout=5)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
 async def get_model_max_len(model_id: str) -> int:
     """Fetches the model's config.json from Hugging Face to find its max length."""
     # For GGUF models, try to get config from the base model if available
@@ -522,7 +539,11 @@ async def start_model_container(model_id: str, container_name: str) -> Container
         async with download_lock:
             logging.info(f"Detected GGUF repo: {model_id}. Downloading GGUF file...")
             actual_model_path, tokenizer_repo = await download_gguf_from_repo(model_id)
-            logging.info(f"Will use local GGUF path: {actual_model_path}")
+            # Translate host path to the path as seen inside the container.
+            # HOST_CACHE_DIR is mounted at CONTAINER_CACHE_MOUNT inside every vLLM container.
+            if actual_model_path.startswith(HOST_CACHE_DIR):
+                actual_model_path = actual_model_path.replace(HOST_CACHE_DIR, CONTAINER_CACHE_MOUNT, 1)
+            logging.info(f"Container model path: {actual_model_path}")
 
     # Only fetch and set max_model_len when the user has configured a global cap.
     # When no cap is set (0), let vLLM auto-detect the correct value for the model.
@@ -535,19 +556,25 @@ async def start_model_container(model_id: str, container_name: str) -> Container
 
     # Add GGUF-specific parameters if this is a GGUF model
     if is_gguf_model(actual_model_path) or tokenizer_repo:
-        # If we downloaded from a repo, use that repo as tokenizer
+        # Verify the inferred tokenizer repo actually exists on HuggingFace before using it.
+        # Third-party GGUF hosters (e.g. TheBloke) produce inferred names that don't exist.
+        if tokenizer_repo and not await hf_repo_exists(tokenizer_repo):
+            logging.warning(f"Inferred tokenizer repo '{tokenizer_repo}' not found on HuggingFace. "
+                            f"vLLM will use the embedded GGUF tokenizer.")
+            tokenizer_repo = None
+
         if tokenizer_repo:
             command.extend(["--tokenizer", tokenizer_repo])
             command.extend(["--hf-config-path", tokenizer_repo])
             logging.info(f"Using tokenizer and config from {tokenizer_repo} for GGUF model")
         else:
             tokenizer_path = extract_tokenizer_from_gguf_path(actual_model_path)
-            if tokenizer_path:
+            if tokenizer_path and await hf_repo_exists(tokenizer_path):
                 command.extend(["--tokenizer", tokenizer_path])
                 command.extend(["--hf-config-path", tokenizer_path])
                 logging.info(f"Using tokenizer and config from {tokenizer_path} for GGUF model {model_id}")
             else:
-                logging.warning(f"No tokenizer path found for GGUF model {model_id}. Using model's embedded tokenizer.")
+                logging.warning(f"No valid tokenizer found for GGUF model {model_id}. Using model's embedded tokenizer.")
 
     if final_max_len > 0:
         command.extend(["--max-model-len", str(final_max_len)])
