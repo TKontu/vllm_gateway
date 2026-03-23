@@ -549,8 +549,6 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             else:
                 logging.warning(f"No tokenizer path found for GGUF model {model_id}. Using model's embedded tokenizer.")
 
-    if int(VLLM_SWAP_SPACE) > 0:
-        command.extend(["--swap-space", VLLM_SWAP_SPACE])
     if final_max_len > 0:
         command.extend(["--max-model-len", str(final_max_len)])
 
