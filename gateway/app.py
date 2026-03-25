@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from functools import partial
 from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from docker.types import DeviceRequest
 from docker.errors import NotFound, APIError
 from dataclasses import dataclass
@@ -113,6 +113,7 @@ class ContainerState:
     port: int
     last_request_time: float
     vram_footprint: float # in MiB
+    active_requests: int = 0  # number of requests currently being proxied to this container
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
@@ -151,7 +152,7 @@ async def lifespan(_app: FastAPI):
     # Startup
     global RESOLVED_DOCKER_NETWORK
     try:
-        gateway_container = docker_client.containers.get(GATEWAY_CONTAINER_NAME)
+        gateway_container = await run_in_executor(docker_client.containers.get, GATEWAY_CONTAINER_NAME)
         networks = gateway_container.attrs['NetworkSettings']['Networks']
         for network_name in networks:
             if network_name.endswith(DOCKER_NETWORK_NAME):
@@ -165,7 +166,7 @@ async def lifespan(_app: FastAPI):
         RESOLVED_DOCKER_NETWORK = DOCKER_NETWORK_NAME
         logging.error(f"Gateway container '{GATEWAY_CONTAINER_NAME}' not found. Falling back to network '{DOCKER_NETWORK_NAME}'.")
 
-    get_total_vram()
+    await get_total_vram()
     load_known_footprints()
     asyncio.create_task(shutdown_inactive_containers())
 
@@ -182,10 +183,16 @@ app = FastAPI(lifespan=lifespan)
 
 # --- Helper Functions ---
 
-def run_nvidia_smi_in_container(command: list[str]) -> str:
+async def run_in_executor(func, *args, **kwargs):
+    """Run a synchronous function in the default thread pool to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, partial(func, *args, **kwargs))
+
+async def run_nvidia_smi_in_container(command: list[str]) -> str:
     """Runs an nvidia-smi command in a temporary container and returns the output."""
     try:
-        smi_output = docker_client.containers.run(
+        smi_output = await run_in_executor(
+            docker_client.containers.run,
             NVIDIA_UTILITY_IMAGE,
             command=command,
             remove=True,
@@ -196,11 +203,11 @@ def run_nvidia_smi_in_container(command: list[str]) -> str:
         logging.error(f"Error running nvidia-smi container: {e}")
         return ""
 
-def get_total_vram():
+async def get_total_vram():
     """Gets total GPU VRAM in MiB."""
     global TOTAL_GPU_VRAM
     logging.info("Getting total GPU VRAM...")
-    output = run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
+    output = await run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
     if output and output.isdigit():
         TOTAL_GPU_VRAM = int(output)
         logging.info(f"Total GPU VRAM: {TOTAL_GPU_VRAM} MiB")
@@ -247,9 +254,9 @@ def save_known_footprints():
     except IOError as e:
         logging.error(f"Could not save memory footprints file: {e}")
 
-def get_used_vram() -> float:
+async def get_used_vram() -> float:
     """Gets currently used GPU VRAM in MiB."""
-    output = run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
+    output = await run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
     if output and output.isdigit():
         return float(output)
     else:
@@ -433,23 +440,32 @@ async def shutdown_inactive_containers():
         except Exception as e:
             logging.error(f"Error in inactivity monitor: {e}", exc_info=True)
 
-async def stop_container(container_name: str):
-    """Stops and removes a container and updates the active_containers state."""
+async def stop_container(container_name: str, drain_timeout: float = 30.0):
+    """Stops and removes a container with graceful draining of in-flight requests."""
+    # Step 1: Remove from routing so no new requests are dispatched to it
+    async with model_management_lock:
+        state = active_containers.pop(container_name, None)
+
+    # Step 2: Wait for any in-flight requests to complete before killing the container
+    if state and state.active_requests > 0:
+        logging.info(f"Draining {state.active_requests} in-flight request(s) from {container_name} (timeout {drain_timeout}s)...")
+        deadline = time.time() + drain_timeout
+        while state.active_requests > 0 and time.time() < deadline:
+            await asyncio.sleep(0.2)
+        if state.active_requests > 0:
+            logging.warning(f"Container {container_name} still had {state.active_requests} active request(s) after drain timeout; force stopping.")
+
+    # Step 3: Stop and remove the Docker container
     try:
-        container = docker_client.containers.get(container_name)
+        container = await run_in_executor(docker_client.containers.get, container_name)
         logging.info(f"Stopping container {container_name}...")
-        container.stop()
-        container.remove()
+        await run_in_executor(container.stop)
+        await run_in_executor(container.remove)
         logging.info(f"Container {container_name} stopped and removed.")
     except NotFound:
         logging.warning(f"Attempted to stop container {container_name}, but it was not found.")
     except APIError as e:
         logging.error(f"Error stopping or removing container {container_name}: {e}")
-
-    # Update active_containers with lock to prevent race conditions
-    async with model_management_lock:
-        if container_name in active_containers:
-            del active_containers[container_name]
 
 async def hf_repo_exists(repo_id: str) -> bool:
     """Return True if repo_id has a readable config.json on HuggingFace."""
@@ -495,19 +511,19 @@ async def start_model_container(model_id: str, container_name: str) -> Container
 
     # Clean up any existing container with the same name (from crashes or improper shutdowns)
     try:
-        existing_container = docker_client.containers.get(container_name)
+        existing_container = await run_in_executor(docker_client.containers.get, container_name)
         logging.warning(f"Found existing container {container_name}. Removing it before starting new one.")
         try:
-            existing_container.stop(timeout=10)
+            await run_in_executor(existing_container.stop, timeout=10)
         except Exception as e:
             logging.warning(f"Could not stop existing container {container_name}: {e}")
-        existing_container.remove(force=True)
+        await run_in_executor(existing_container.remove, force=True)
         logging.info(f"Removed stale container {container_name}")
 
         # Verify container is actually removed before proceeding
         for attempt in range(10):
             try:
-                docker_client.containers.get(container_name)
+                await run_in_executor(docker_client.containers.get, container_name)
                 # Container still exists, wait and retry
                 await asyncio.sleep(0.5)
             except NotFound:
@@ -590,14 +606,15 @@ async def start_model_container(model_id: str, container_name: str) -> Container
         command.append("--async-scheduling")
         logging.info(f"Added --async-scheduling flag for gpt-oss model optimization")
 
-    if VLLM_ENFORCE_EAGER:
+    if VLLM_ENFORCE_EAGER or VLLM_NO_CUDAGRAPH:
         command.append("--enforce-eager")
 
     try:
         vllm_image = get_vllm_image_for_model(model_id)
         logging.info(f"Using vLLM image: {vllm_image} for model {model_id}")
         logging.info(f"Starting container {container_name} with command: {' '.join(command)}")
-        new_container = docker_client.containers.run(
+        new_container = await run_in_executor(
+            docker_client.containers.run,
             vllm_image,
             command=command,
             name=container_name,
@@ -607,7 +624,6 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             environment={
                 "HUGGING_FACE_HUB_TOKEN": HF_TOKEN,
                 "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
-                **({"VLLM_NO_CUDAGRAPH": "1"} if VLLM_NO_CUDAGRAPH else {}),
                 "VLLM_CACHE_BUST": str(uuid.uuid4()),
             },
             ipc_mode="host",
@@ -617,7 +633,7 @@ async def start_model_container(model_id: str, container_name: str) -> Container
                 VLLM_TEMP_DIR: {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
             }
         )
-        new_container.reload()
+        await run_in_executor(new_container.reload)
 
         # Safely retrieve network IP address
         networks = new_container.attrs.get('NetworkSettings', {}).get('Networks', {})
@@ -625,8 +641,8 @@ async def start_model_container(model_id: str, container_name: str) -> Container
         if not network_info or not network_info.get('IPAddress'):
             logging.error(f"Failed to get IP address for container {container_name} on network {RESOLVED_DOCKER_NETWORK}")
             logging.error(f"Available networks: {list(networks.keys())}")
-            new_container.stop()
-            new_container.remove()
+            await run_in_executor(new_container.stop)
+            await run_in_executor(new_container.remove)
             return None
 
         ip_address = network_info['IPAddress']
@@ -637,6 +653,26 @@ async def start_model_container(model_id: str, container_name: str) -> Container
 
         for i in range(1800): # ~1 hour timeout (1800 * 2s = 3600s)
             await asyncio.sleep(2)
+
+            # Check container is still running every 20 seconds to detect crashes early
+            if i % 10 == 0:
+                try:
+                    await run_in_executor(new_container.reload)
+                    status = new_container.status
+                    if status not in ('running', 'created'):
+                        try:
+                            logs = (await run_in_executor(new_container.logs, tail=50)).decode('utf-8', errors='replace')
+                        except Exception:
+                            logs = "(could not retrieve logs)"
+                        logging.error(f"Container {container_name} exited with status '{status}' during startup. Last logs:\n{logs}")
+                        await run_in_executor(new_container.remove, force=True)
+                        return None
+                except NotFound:
+                    logging.error(f"Container {container_name} disappeared unexpectedly during startup.")
+                    return None
+                except Exception as e:
+                    logging.warning(f"Could not check container status for {container_name}: {e}")
+
             try:
                 response = await http_client.get(f"{vllm_base_url}/health", timeout=2)
                 if response.status_code == 200:
@@ -650,6 +686,9 @@ async def start_model_container(model_id: str, container_name: str) -> Container
                         last_request_time=time.time(),
                         vram_footprint=0 # Footprint is unknown until measured
                     )
+                elif response.status_code != 503:
+                    # 503 is expected during vLLM initialization; anything else is worth noting
+                    logging.warning(f"Unexpected health check status {response.status_code} for {model_id} (attempt {i+1})")
             except httpx.RequestError:
                 # Log progress every 30 seconds (15 attempts * 2s)
                 if i > 0 and (i + 1) % 15 == 0:
@@ -799,7 +838,7 @@ async def proxy_request(request: Request):
                             for name in container_names_to_stop:
                                 await stop_container(name)
 
-                            vram_before = get_used_vram()
+                            vram_before = await get_used_vram()
                             logging.info(f"VRAM usage before model load: {vram_before} MiB")
 
                             container_name = f"{VLLM_CONTAINER_PREFIX}_0"
@@ -810,13 +849,13 @@ async def proxy_request(request: Request):
                                 # Wait for model to fully load into VRAM and take multiple measurements
                                 logging.info("Waiting for model to fully load into VRAM (taking 3 measurements over 45 seconds)...")
                                 await asyncio.sleep(15)
-                                vram_samples = [get_used_vram()]
+                                vram_samples = [await get_used_vram()]
 
                                 await asyncio.sleep(15)
-                                vram_samples.append(get_used_vram())
+                                vram_samples.append(await get_used_vram())
 
                                 await asyncio.sleep(15)
-                                vram_samples.append(get_used_vram())
+                                vram_samples.append(await get_used_vram())
 
                                 # Use maximum VRAM measurement to ensure we capture full footprint
                                 vram_after = max(vram_samples)
@@ -832,6 +871,8 @@ async def proxy_request(request: Request):
                                 else:
                                     logging.warning(f"Could not measure accurate footprint for {target_model_id} (calculated {measured_vram} MiB). Using container without VRAM management.")
                                     target_container.vram_footprint = 0  # Mark as unknown
+                                    known_footprints[target_model_id] = 0  # sentinel: seen but unmeasurable — prevents repeat discovery runs
+                                    save_known_footprints()
 
                                 # Update active_containers with lock
                                 async with model_management_lock:
@@ -911,6 +952,12 @@ async def proxy_request(request: Request):
             # Get current queue depth for headers
             current_queue_depth = model_queue_counts.get(target_model_id, 0)
 
+            # Track in-flight requests for graceful container draining.
+            # For streaming, the generator owns the decrement (it runs after this function returns).
+            # For non-streaming, the finally block below decrements.
+            target_container.active_requests += 1
+            active_req_decremented = False
+
             # Request proxying happens outside all locks
             try:
                 # Update model field in body before proxying
@@ -925,35 +972,6 @@ async def proxy_request(request: Request):
                 # Check if this is a streaming request
                 is_streaming = body.get('stream', False)
 
-                # Retry logic for transient connection failures
-                # Only retries connection errors (ConnectError, ConnectTimeout, PoolTimeout)
-                # HTTP errors (4xx, 5xx) are not retried as they're not transient
-                max_retries = 3
-                retry_delay = 1.0  # seconds
-
-                for retry_attempt in range(max_retries):
-                    try:
-                        # Proxy request using the original HTTP method
-                        # Uses timeout configured in http_client (GATEWAY_REQUEST_TIMEOUT)
-                        response = await http_client.request(
-                            method=request.method,
-                            url=vllm_url,
-                            json=body,
-                            headers=headers_to_forward
-                        )
-                        response.raise_for_status()
-                        break  # Success - exit retry loop
-                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-                        # Connection error - may be transient, retry if attempts remain
-                        if retry_attempt < max_retries - 1:
-                            logging.warning(f"Transient connection error to vLLM for {model_name} (attempt {retry_attempt + 1}/{max_retries}): {type(e).__name__}. Retrying in {retry_delay}s...")
-                            await asyncio.sleep(retry_delay)
-                            retry_delay *= 1.5  # Exponential backoff
-                        else:
-                            # Final attempt failed - log and re-raise
-                            logging.error(f"Failed to connect to vLLM for {model_name} after {max_retries} attempts: {type(e).__name__}: {str(e)}")
-                            raise  # Re-raise to trigger httpx.RequestError handler below
-
                 # Add queue status headers to response
                 queue_headers = {
                     "X-Queue-Depth": str(current_queue_depth),
@@ -961,29 +979,65 @@ async def proxy_request(request: Request):
                     "X-Max-Queue-Size": str(GATEWAY_MAX_QUEUE_SIZE)
                 }
 
-                # Handle streaming vs non-streaming responses
                 if is_streaming:
-                    # For streaming responses, return the raw content with appropriate headers
-                    from fastapi.responses import StreamingResponse
+                    # True streaming: open the connection and yield chunks as they arrive.
+                    # http_client.stream() keeps the connection alive while the generator runs.
+                    # The generator owns the active_requests decrement so it fires after the
+                    # last byte is sent to the client, not when StreamingResponse is constructed.
+                    captured_container = target_container
 
-                    async def generate():
-                        async for chunk in response.aiter_bytes():
-                            yield chunk
+                    async def stream_generate():
+                        try:
+                            async with http_client.stream(
+                                request.method, vllm_url,
+                                json=body, headers=headers_to_forward
+                            ) as r:
+                                async for chunk in r.aiter_bytes():
+                                    if chunk:
+                                        yield chunk
+                        finally:
+                            captured_container.active_requests -= 1
 
-                    response_headers = {k: v for k, v in response.headers.items()
-                            if k.lower() not in ('content-length', 'transfer-encoding', 'connection')}
-                    response_headers.update(queue_headers)
+                    active_req_decremented = True  # generator owns the decrement from here
 
                     return StreamingResponse(
-                        generate(),
-                        status_code=response.status_code,
-                        media_type=response.headers.get('content-type', 'text/event-stream'),
-                        headers=response_headers
+                        stream_generate(),
+                        status_code=200,
+                        media_type="text/event-stream",
+                        headers=queue_headers
                     )
                 else:
-                    # For non-streaming responses, return JSON as before
+                    # Non-streaming: buffer full response, then return.
+                    # Retry only transient connection errors; HTTP errors are not retried.
+                    max_retries = 3
+                    retry_delay = 1.0  # seconds
+
+                    for retry_attempt in range(max_retries):
+                        try:
+                            response = await http_client.request(
+                                method=request.method,
+                                url=vllm_url,
+                                json=body,
+                                headers=headers_to_forward
+                            )
+                            response.raise_for_status()
+                            break  # Success - exit retry loop
+                        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                            if retry_attempt < max_retries - 1:
+                                logging.warning(f"Transient connection error to vLLM for {model_name} (attempt {retry_attempt + 1}/{max_retries}): {type(e).__name__}. Retrying in {retry_delay}s...")
+                                await asyncio.sleep(retry_delay)
+                                retry_delay *= 1.5  # Exponential backoff
+                            else:
+                                logging.error(f"Failed to connect to vLLM for {model_name} after {max_retries} attempts: {type(e).__name__}: {str(e)}")
+                                raise  # Re-raise to trigger httpx.RequestError handler below
+
+                    try:
+                        content = response.json()
+                    except Exception:
+                        content = {"error": "Non-JSON response from vLLM", "raw": response.text[:500]}
+                        logging.warning(f"Non-JSON response from vLLM for {model_name}: status={response.status_code}, body={response.text[:200]}")
                     return JSONResponse(
-                        content=response.json(),
+                        content=content,
                         status_code=response.status_code,
                         headers=queue_headers
                     )
@@ -997,6 +1051,9 @@ async def proxy_request(request: Request):
             except httpx.RequestError as e:
                 logging.error(f"Connection error to vLLM for {model_name} ({target_model_id}) at {vllm_url}: {type(e).__name__}: {str(e)}")
                 raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
+            finally:
+                if not active_req_decremented:
+                    target_container.active_requests -= 1
     except Exception:
         # Exception cleanup: If the counter was incremented but never decremented
         # (because exception occurred before or during the decrement operation),
