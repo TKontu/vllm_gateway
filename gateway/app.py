@@ -327,11 +327,12 @@ def infer_base_model_from_gguf_repo(gguf_repo_id: str) -> str:
     logging.info(f"Inferred base model '{base_model}' from GGUF repo '{gguf_repo_id}'")
     return base_model
 
-async def download_gguf_from_repo(repo_id: str) -> tuple[str, str]:
+async def download_gguf_from_repo(repo_id: str, quant_hint: str = "") -> tuple[str, str]:
     """
     Downloads a GGUF file from a HuggingFace repo and returns (local_path, tokenizer_repo).
     Returns the path to the downloaded GGUF file and the inferred base model repo for tokenizer.
     Uses async executor to avoid blocking the event loop during large downloads.
+    quant_hint: optional quantization string (e.g. "Q4_K_M") to select a specific file.
     """
     try:
         logging.info(f"Attempting to download GGUF file from repo: {repo_id}")
@@ -350,27 +351,29 @@ async def download_gguf_from_repo(repo_id: str) -> tuple[str, str]:
         if not gguf_files:
             raise ValueError(f"No GGUF files found in repo {repo_id}")
 
-        # Smart GGUF file selection: prefer file matching quantization hint in repo name
+        # Smart GGUF file selection: prefer file matching quantization hint.
+        # Priority: explicit quant_hint arg > hint extracted from repo name.
         # e.g., "google/gemma-3-12b-it-qat-q4_0-gguf" -> prefer files with "q4_0"
         gguf_filename = gguf_files[0]  # Default to first file
 
         if len(gguf_files) > 1:
-            # Extract potential quantization hint from repo name
-            repo_name = repo_id.split('/')[-1]  # e.g., "gemma-3-12b-it-qat-q4_0-gguf"
-
-            # Look for quantization patterns like q4_0, q4_1, q8_0, etc.
+            # Use explicit quant_hint if provided, otherwise extract from repo name
             import re
-            quant_patterns = re.findall(r'q\d+_[k0-9]+|q\d+', repo_name.lower())
+            if quant_hint:
+                resolved_hint = quant_hint.lower()
+            else:
+                repo_name = repo_id.split('/')[-1]  # e.g., "gemma-3-12b-it-qat-q4_0-gguf"
+                quant_patterns = re.findall(r'q\d+_[k0-9]+|q\d+', repo_name.lower())
+                resolved_hint = quant_patterns[-1] if quant_patterns else ""
 
-            if quant_patterns:
-                quant_hint = quant_patterns[-1]  # Use last match (usually most specific)
-                matching_files = [f for f in gguf_files if quant_hint in f.lower()]
+            if resolved_hint:
+                matching_files = [f for f in gguf_files if resolved_hint in f.lower()]
 
                 if matching_files:
                     gguf_filename = matching_files[0]
-                    logging.info(f"Selected GGUF file '{gguf_filename}' based on quantization hint '{quant_hint}'")
+                    logging.info(f"Selected GGUF file '{gguf_filename}' based on quantization hint '{resolved_hint}'")
                 else:
-                    logging.warning(f"No GGUF file matched quantization hint '{quant_hint}', using '{gguf_filename}'")
+                    logging.warning(f"No GGUF file matched quantization hint '{resolved_hint}', using '{gguf_filename}'")
 
             logging.info(f"Found {len(gguf_files)} GGUF files, selected: {gguf_filename}")
         else:
@@ -543,7 +546,20 @@ async def start_model_container(model_id: str, container_name: str) -> Container
     actual_model_path = model_id
     tokenizer_repo = None
 
-    if is_gguf_repo(model_id):
+    # Detect "repo:quant_type" format where the repo is a GGUF-only repo (no config.json).
+    # vLLM's native repo:quant format requires config.json, which GGUF-only repos lack.
+    # Handle these ourselves: strip the quant suffix, download via the gateway, pass a local path.
+    gguf_quant_hint = ""
+    resolved_model_id = model_id
+    if ':' in model_id and not model_id.startswith(('http://', 'https://')):
+        repo_part, quant_part = model_id.rsplit(':', 1)
+        if is_gguf_repo(repo_part):
+            resolved_model_id = repo_part
+            gguf_quant_hint = quant_part
+            logging.info(f"Detected GGUF repo:quant format '{model_id}'. "
+                         f"Will download '{resolved_model_id}' with quant hint '{gguf_quant_hint}'.")
+
+    if is_gguf_repo(resolved_model_id):
         # Ensure only one download per model at a time (protect lock creation with global lock)
         async with model_management_lock:
             if model_id not in download_locks:
@@ -551,8 +567,8 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             download_lock = download_locks[model_id]
 
         async with download_lock:
-            logging.info(f"Detected GGUF repo: {model_id}. Downloading GGUF file...")
-            actual_model_path, tokenizer_repo = await download_gguf_from_repo(model_id)
+            logging.info(f"Detected GGUF repo: {resolved_model_id}. Downloading GGUF file...")
+            actual_model_path, tokenizer_repo = await download_gguf_from_repo(resolved_model_id, gguf_quant_hint)
             # Translate host path to the path as seen inside the container.
             # HOST_CACHE_DIR is mounted at CONTAINER_CACHE_MOUNT inside every vLLM container.
             if actual_model_path.startswith(HOST_CACHE_DIR):

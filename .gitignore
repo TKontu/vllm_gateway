@@ -1,8 +1,9 @@
 my-vllm-gateway.tar
 *.log
-/venv/*
+.venv/*
 my-vlmm-gateway.tar
 *.mdb
 data/
 memory_footprints.json
 cheatsheet*
+.venv/
