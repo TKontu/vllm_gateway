@@ -75,9 +75,6 @@ services:
       VLLM_INACTIVITY_TIMEOUT: "1800" # 30 minutes
       # Global cap on model context length. 0 means use model's native max length.
       VLLM_MAX_MODEL_LEN_GLOBAL: "0"
-      # vLLM CPU swap space in GB.
-      VLLM_SWAP_SPACE: "16"
-
       # --- LOGGING ---
       LOG_LEVEL: "INFO" # DEBUG, INFO, WARNING, ERROR
 
@@ -133,7 +130,6 @@ The `.env` file will be automatically loaded by Docker Compose.
 |----------|---------|-------------|
 | `VLLM_IMAGE` | `vllm/vllm-openai:v0.10.2` | Docker image for vLLM model containers |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | GPU memory utilization (0.0 to 1.0) |
-| `VLLM_SWAP_SPACE` | `16` | CPU swap space in GB for offloading |
 | `VLLM_MAX_MODEL_LEN_GLOBAL` | `0` | Global max context length (0 = use model default) |
 | `VLLM_MAX_NUM_SEQS` | `16` | Maximum concurrent sequences |
 | `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of GPUs to split model across |

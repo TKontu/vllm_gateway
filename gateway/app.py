@@ -26,7 +26,6 @@ CONTAINER_CACHE_MOUNT = '/root/.cache/huggingface'  # Where HOST_CACHE_DIR is mo
 VLLM_PORT = int(os.getenv("VLLM_PORT", "8000"))
 VLLM_IMAGE = os.getenv("VLLM_IMAGE", "vllm/vllm-openai:v0.10.2")
 VLLM_GPU_MEMORY_UTILIZATION = os.getenv("VLLM_GPU_MEMORY_UTILIZATION", "0.90")
-VLLM_SWAP_SPACE = os.getenv("VLLM_SWAP_SPACE", "16")
 VLLM_MAX_MODEL_LEN_GLOBAL = int(os.getenv("VLLM_MAX_MODEL_LEN_GLOBAL", "0"))
 VLLM_MAX_NUM_SEQS = os.getenv("VLLM_MAX_NUM_SEQS", "16")
 VLLM_TENSOR_PARALLEL_SIZE = os.getenv("VLLM_TENSOR_PARALLEL_SIZE", "1")
@@ -492,15 +491,14 @@ async def get_model_max_len(model_id: str) -> int:
         config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(config_url, follow_redirects=True)
-            response.raise_for_status()
-            config = response.json()
-            keys_to_check = ['max_position_embeddings', 'n_positions', 'model_max_length']
-            for key in keys_to_check:
-                if key in config and isinstance(config[key], int):
-                    return config[key]
-            return 0
+        response = await http_client.get(config_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
+        response.raise_for_status()
+        config = response.json()
+        keys_to_check = ['max_position_embeddings', 'n_positions', 'model_max_length']
+        for key in keys_to_check:
+            if key in config and isinstance(config[key], int):
+                return config[key]
+        return 0
     except Exception as e:
         logging.error(f"An error occurred while getting max length for {model_id}: {e}")
         return 0
@@ -792,16 +790,32 @@ async def proxy_request(request: Request):
     # We track the INCREMENT (which always happens), not the decrement (which may fail)
     counter_needs_cleanup = True
 
+    # Acquire semaphore manually (not via `async with`) so we can transfer ownership
+    # of the release to the streaming generator. With `async with`, the slot is released
+    # when proxy_request returns — before a single streaming byte is sent — making
+    # GATEWAY_MAX_CONCURRENT ineffective for streaming workloads.
+    sem = model_semaphores[target_model_id]
+    sem_released = False  # True once the streaming generator takes ownership of sem.release()
+
+    # Step 1: acquire — CancelledError here means the semaphore is NOT held
     try:
-        # Acquire semaphore slot (wait in queue if necessary)
-        async with model_semaphores[target_model_id]:
-            # Decrement queue counter now that we have a semaphore slot
-            # CRITICAL: Mark cleanup flag BEFORE decrement to prevent double-decrement
-            # if logging.debug() fails after decrement but before flag is set
+        await sem.acquire()
+    except BaseException:
+        if counter_needs_cleanup:
             async with queue_count_lock:
-                counter_needs_cleanup = False  # Set flag FIRST
                 model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
-                logging.debug(f"Request dequeued for {model_name} ({target_model_id}). Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
+                logging.debug(f"Exception cleanup (pre-acquire): decremented queue counter for {model_name}. Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
+        raise
+
+    # Step 2: semaphore is held — run all logic; finally releases it unless generator took over
+    try:
+        # Decrement queue counter now that we have a semaphore slot
+        # CRITICAL: Mark cleanup flag BEFORE decrement to prevent double-decrement
+        # if logging.debug() fails after decrement but before flag is set
+        async with queue_count_lock:
+            counter_needs_cleanup = False  # Set flag FIRST
+            model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
+            logging.debug(f"Request dequeued for {model_name} ({target_model_id}). Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
 
             # Quick check for existing container (no lock needed for read-only check)
             target_container: ContainerState = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
@@ -982,9 +996,11 @@ async def proxy_request(request: Request):
                 if is_streaming:
                     # True streaming: open the connection and yield chunks as they arrive.
                     # http_client.stream() keeps the connection alive while the generator runs.
-                    # The generator owns the active_requests decrement so it fires after the
-                    # last byte is sent to the client, not when StreamingResponse is constructed.
+                    # The generator owns BOTH active_requests decrement AND semaphore release,
+                    # so both fire after the last byte is sent (or client disconnects), not when
+                    # StreamingResponse is constructed and proxy_request returns.
                     captured_container = target_container
+                    captured_sem = sem
 
                     async def stream_generate():
                         try:
@@ -997,8 +1013,10 @@ async def proxy_request(request: Request):
                                         yield chunk
                         finally:
                             captured_container.active_requests -= 1
+                            captured_sem.release()  # enforce GATEWAY_MAX_CONCURRENT for full stream duration
 
-                    active_req_decremented = True  # generator owns the decrement from here
+                    sem_released = True        # generator takes ownership of sem.release()
+                    active_req_decremented = True  # generator owns active_requests decrement
 
                     return StreamingResponse(
                         stream_generate(),
@@ -1054,18 +1072,19 @@ async def proxy_request(request: Request):
             finally:
                 if not active_req_decremented:
                     target_container.active_requests -= 1
-    except Exception:
+    except BaseException:
         # Exception cleanup: If the counter was incremented but never decremented
         # (because exception occurred before or during the decrement operation),
         # we need to decrement it here to avoid leaking the queue counter.
-        # This handles cases like:
-        # - Semaphore acquisition cancelled (asyncio.CancelledError)
-        # - Exception before semaphore acquired
-        # - Exception during decrement operation (between line 700-704)
-        # - Container start failures
-        # - HTTP request failures
+        # Uses BaseException (not Exception) to also catch asyncio.CancelledError,
+        # which is raised when uvicorn cancels a task during graceful shutdown.
         if counter_needs_cleanup:
             async with queue_count_lock:
                 model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
                 logging.debug(f"Exception cleanup: decremented queue counter for {model_name} ({target_model_id}). Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
         raise
+    finally:
+        # Release semaphore for all non-streaming exits (success and error).
+        # Streaming requests set sem_released=True so their generator handles release.
+        if not sem_released:
+            sem.release()
