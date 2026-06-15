@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 from config_loader import (  # noqa: E402
     resolve_model_configs, build_fallback_configs, resolve_pools,
     validate_model_pools, validate_tp_against_pools, validate_colocate,
-    validate_pools_visible,
+    validate_pools_visible, migrate_footprints,
 )
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
@@ -273,6 +273,22 @@ def test_validate_pools_visible():
     else:
         raise AssertionError("expected ValueError for a missing UUID")
     print("ok: validate_pools_visible")
+
+
+def test_migrate_footprints():
+    # legacy {repo: number} -> record with tp=1; new shape passes through; corrupt dropped.
+    out = migrate_footprints({
+        "org/a": 20000,                                              # legacy scalar
+        "org/b": {"per_gpu_mib": 13000, "effective_tp": 2, "measured_at": 5.0},  # new shape
+        "org/c": 0,                                                  # legacy sentinel
+        "org/bad": "nonsense",                                       # corrupt -> dropped
+    })
+    assert out["org/a"] == {"per_gpu_mib": 20000.0, "effective_tp": 1, "measured_at": 0.0}
+    assert out["org/b"]["effective_tp"] == 2 and out["org/b"]["per_gpu_mib"] == 13000.0
+    assert out["org/c"] == {"per_gpu_mib": 0.0, "effective_tp": 1, "measured_at": 0.0}
+    assert "org/bad" not in out
+    assert migrate_footprints({}) == {} and migrate_footprints(None) == {}
+    print("ok: migrate_footprints")
 
 
 if __name__ == "__main__":
