@@ -14,6 +14,9 @@ from docker.types import DeviceRequest
 from docker.errors import NotFound, APIError
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download, list_repo_files
+import yaml
+import placement
+from config_loader import ModelConfig, resolve_model_configs, build_fallback_configs
 
 # --- Logging Configuration ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -39,9 +42,26 @@ NVIDIA_UTILITY_IMAGE = os.getenv("NVIDIA_UTILITY_IMAGE", "nvidia/cuda:12.1.0-bas
 MEMORY_FOOTPRINT_FILE = os.getenv("MEMORY_FOOTPRINT_FILE", "/app/data/memory_footprints.json")
 VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 
+# Path to the per-model YAML config. When present, it replaces ALLOWED_MODELS_JSON.
+MODELS_CONFIG_FILE = os.getenv("MODELS_CONFIG_FILE", "/app/config/models.yaml")
+
+# --- GPU Pinning ---
+# Optionally pin this gateway instance (and every vLLM container it launches) to a
+# single GPU by UUID. Leave unset to use all GPUs (default, unchanged behavior).
+GATEWAY_GPU_UUID = os.getenv("GATEWAY_GPU_UUID", "").strip()
+if GATEWAY_GPU_UUID:
+    GPU_DEVICE_REQUESTS = [DeviceRequest(device_ids=[GATEWAY_GPU_UUID], capabilities=[['gpu']])]
+else:
+    GPU_DEVICE_REQUESTS = [DeviceRequest(count=-1, capabilities=[['gpu']])]
+
 # Queue management configuration
 GATEWAY_MAX_QUEUE_SIZE = int(os.getenv("GATEWAY_MAX_QUEUE_SIZE", "200"))  # Max requests in queue per model
 GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max concurrent requests to vLLM per model
+
+# Anti-thrash: minimum seconds a freshly-loaded model is preferentially kept resident before it
+# becomes a candidate for eviction-to-make-room. Eviction falls back to fresh models only if no
+# older candidate frees enough VRAM (so a single-GPU swap is never blocked). 0 disables the cooldown.
+GATEWAY_MIN_RESIDENT_SECONDS = int(os.getenv("GATEWAY_MIN_RESIDENT_SECONDS", "90"))
 
 # Timeout configuration (in seconds)
 GATEWAY_REQUEST_TIMEOUT = int(os.getenv("GATEWAY_REQUEST_TIMEOUT", "300"))  # Total request timeout (default 5 minutes)
@@ -93,6 +113,7 @@ def is_gpt_oss_model(model_id: str) -> bool:
 # --- Global State ---
 RESOLVED_DOCKER_NETWORK = None
 TOTAL_GPU_VRAM = 0  # in MiB
+GPU_VRAM = {}  # uuid -> {"total": int MiB, "used": float MiB}; per-GPU foundation for multi-GPU placement
 known_footprints = {}
 active_containers = {}
 model_management_lock = asyncio.Lock()  # For updating active_containers dict
@@ -113,6 +134,9 @@ class ContainerState:
     last_request_time: float
     vram_footprint: float # in MiB
     active_requests: int = 0  # number of requests currently being proxied to this container
+    always_on: bool = False  # if True, never auto-unloaded by the inactivity monitor
+    inactivity_timeout: int = VLLM_INACTIVITY_TIMEOUT  # per-model idle timeout (seconds; 0 = never unload)
+    loaded_at: float = 0.0  # time.time() when the container became ready (for anti-thrash cooldown)
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
@@ -195,21 +219,56 @@ async def run_nvidia_smi_in_container(command: list[str]) -> str:
             NVIDIA_UTILITY_IMAGE,
             command=command,
             remove=True,
-            device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])]
+            device_requests=GPU_DEVICE_REQUESTS
         )
         return smi_output.decode('utf-8').strip()
     except APIError as e:
         logging.error(f"Error running nvidia-smi container: {e}")
         return ""
 
+def _parse_float(s: str) -> float:
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+async def get_gpu_vram() -> dict:
+    """Returns {uuid: {"total": int MiB, "used": float MiB}} for every visible GPU.
+
+    When the gateway is pinned (GATEWAY_GPU_UUID set), the probe container only sees that
+    one GPU, so the map has a single entry. Unpinned, it lists all visible GPUs — parsing
+    every CSV line instead of just the first (which read GPU 0 only)."""
+    output = await run_nvidia_smi_in_container(
+        ["nvidia-smi", "--query-gpu=uuid,memory.total,memory.used", "--format=csv,noheader,nounits"]
+    )
+    gpus = {}
+    for line in output.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            continue
+        uuid, total, used = parts
+        if uuid and total.isdigit():
+            gpus[uuid] = {"total": int(total), "used": _parse_float(used)}
+    return gpus
+
+def _managed_vram(gpus: dict, key: str) -> float:
+    """Sum a VRAM field across the GPUs this instance manages.
+
+    Pinned -> just that GPU; unpinned -> all visible GPUs (single-pool semantics, unchanged)."""
+    if GATEWAY_GPU_UUID and GATEWAY_GPU_UUID in gpus:
+        return gpus[GATEWAY_GPU_UUID][key]
+    return sum(g[key] for g in gpus.values())
+
 async def get_total_vram():
-    """Gets total GPU VRAM in MiB."""
-    global TOTAL_GPU_VRAM
+    """Measures per-GPU VRAM, stores the per-UUID map, and sets the managed total (MiB)."""
+    global TOTAL_GPU_VRAM, GPU_VRAM
     logging.info("Getting total GPU VRAM...")
-    output = await run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-    if output and output.isdigit():
-        TOTAL_GPU_VRAM = int(output)
-        logging.info(f"Total GPU VRAM: {TOTAL_GPU_VRAM} MiB")
+    GPU_VRAM = await get_gpu_vram()
+    if GPU_VRAM:
+        for uuid, v in GPU_VRAM.items():
+            logging.info(f"GPU {uuid}: {v['total']} MiB total")
+        TOTAL_GPU_VRAM = int(_managed_vram(GPU_VRAM, "total"))
+        logging.info(f"Managed total GPU VRAM: {TOTAL_GPU_VRAM} MiB across {len(GPU_VRAM)} GPU(s)")
     else:
         logging.error("Could not determine total GPU VRAM. Disabling dynamic memory management.")
         TOTAL_GPU_VRAM = 0
@@ -254,13 +313,12 @@ def save_known_footprints():
         logging.error(f"Could not save memory footprints file: {e}")
 
 async def get_used_vram() -> float:
-    """Gets currently used GPU VRAM in MiB."""
-    output = await run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-    if output and output.isdigit():
-        return float(output)
-    else:
+    """Gets currently used GPU VRAM (MiB) across the managed GPU(s)."""
+    gpus = await get_gpu_vram()
+    if not gpus:
         logging.error("Could not determine used GPU VRAM.")
         return 0.0
+    return float(_managed_vram(gpus, "used"))
 
 def is_gguf_model(model_id: str) -> bool:
     """Check if the model_id refers to a GGUF file."""
@@ -404,7 +462,7 @@ async def download_gguf_from_repo(repo_id: str, quant_hint: str = "") -> tuple[s
         raise HTTPException(status_code=500, detail=f"Failed to download GGUF model: {e}")
 
 def load_allowed_models():
-    """Load allowed models from environment variable."""
+    """Load allowed models from environment variable (legacy ALLOWED_MODELS_JSON fallback)."""
     models_json = os.getenv("ALLOWED_MODELS_JSON")
     if models_json:
         try:
@@ -413,25 +471,81 @@ def load_allowed_models():
             logging.warning("Invalid JSON in ALLOWED_MODELS_JSON. Using default empty set.")
     return {}
 
-ALLOWED_MODELS = load_allowed_models()
+def builtin_model_defaults() -> dict:
+    """Bottom-tier defaults for the config resolver, sourced from the legacy global env vars.
+
+    These are the values used when neither a per-model entry nor the YAML 'defaults'
+    block specifies a setting — preserving the exact pre-config-file behavior.
+    """
+    return {
+        "gpu_memory_utilization": float(VLLM_GPU_MEMORY_UTILIZATION),
+        "max_model_len": VLLM_MAX_MODEL_LEN_GLOBAL,
+        "tensor_parallel_size": int(VLLM_TENSOR_PARALLEL_SIZE),
+        "quantization": None,
+        "dtype": "auto",
+        "inactivity_timeout": VLLM_INACTIVITY_TIMEOUT,
+        "always_on": False,
+        "extra_args": [],
+    }
+
+def load_model_configs() -> "dict[str, ModelConfig]":
+    """Load per-model configuration.
+
+    Uses MODELS_CONFIG_FILE (YAML) when it exists; otherwise falls back to the legacy
+    ALLOWED_MODELS_JSON env var with built-in defaults (behaves exactly as before).
+    Raises on a malformed config file so the gateway fails fast at startup.
+    """
+    builtins = builtin_model_defaults()
+
+    if MODELS_CONFIG_FILE and os.path.isfile(MODELS_CONFIG_FILE):
+        logging.info(f"Loading model configuration from {MODELS_CONFIG_FILE}")
+        with open(MODELS_CONFIG_FILE, 'r') as f:
+            raw = yaml.safe_load(f)
+        if not raw:
+            raise ValueError(f"Model config file '{MODELS_CONFIG_FILE}' is empty or not valid YAML")
+        configs = resolve_model_configs(raw, builtins)
+        logging.info(f"Loaded {len(configs)} model(s) from {MODELS_CONFIG_FILE}: {list(configs)}")
+        return configs
+
+    if MODELS_CONFIG_FILE and os.path.isdir(MODELS_CONFIG_FILE):
+        # A directory at the mount target usually means Docker created a missing file mount.
+        logging.warning(f"MODELS_CONFIG_FILE '{MODELS_CONFIG_FILE}' is a directory, not a file. "
+                        f"Falling back to ALLOWED_MODELS_JSON.")
+
+    allowed = load_allowed_models()
+    configs = build_fallback_configs(allowed, builtins)
+    logging.info(f"No model config file at '{MODELS_CONFIG_FILE}'; using ALLOWED_MODELS_JSON fallback "
+                 f"({len(configs)} model(s)): {list(configs)}")
+    return configs
+
+# Resolve model configuration at import time so a bad config fails fast (refuses to start).
+MODEL_CONFIGS = load_model_configs()
+# name -> repo map, preserved for existing lookups throughout the app.
+ALLOWED_MODELS = {name: cfg.repo for name, cfg in MODEL_CONFIGS.items()}
 
 # --- Background Tasks ---
 
 async def shutdown_inactive_containers():
-    """A background task that checks for inactivity and shuts down containers."""
-    logging.info(f"Starting inactivity monitor with a {VLLM_INACTIVITY_TIMEOUT}s timeout.")
+    """A background task that checks for inactivity and shuts down containers.
+
+    Each container uses its own resolved inactivity_timeout. Containers whose model
+    is marked always_on (or whose timeout is 0) are never auto-unloaded.
+    """
+    logging.info("Starting inactivity monitor (per-model timeouts; always_on models are never unloaded).")
     while True:
         try:
             await asyncio.sleep(60)
-            if VLLM_INACTIVITY_TIMEOUT <= 0:
-                continue
 
             # Determine which containers are inactive with lock
             async with model_management_lock:
                 current_time = time.time()
                 inactive_containers = []
                 for name, state in active_containers.items():
-                    if current_time - state.last_request_time > VLLM_INACTIVITY_TIMEOUT:
+                    if state.always_on:
+                        continue
+                    if state.inactivity_timeout <= 0:
+                        continue  # 0 = never unload
+                    if current_time - state.last_request_time > state.inactivity_timeout:
                         inactive_containers.append(name)
 
             # Stop containers outside lock (I/O operation)
@@ -506,8 +620,36 @@ async def get_model_max_len(model_id: str) -> int:
         logging.error(f"An error occurred while getting max length for {model_id}: {e}")
         return 0
 
-async def start_model_container(model_id: str, container_name: str) -> ContainerState | None:
-    """Starts a new vLLM container."""
+def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
+    """Append raw extra_args verbatim, letting them override any flag the base set.
+
+    Any '--flag' present in extra_args removes the gateway-generated occurrence of that
+    flag (and its following value, if any) from base, so the explicit config value wins
+    and no flag is duplicated.
+    """
+    extra = [str(a) for a in extra]
+    extra_flags = {tok for tok in extra if tok.startswith("--")}
+    if not extra_flags:
+        return base + extra
+
+    merged: "list[str]" = []
+    i = 0
+    while i < len(base):
+        tok = base[i]
+        if tok in extra_flags:
+            # Drop this flag and its value (next token, unless that token is itself a flag).
+            if i + 1 < len(base) and not base[i + 1].startswith("--"):
+                i += 2
+            else:
+                i += 1
+            continue
+        merged.append(tok)
+        i += 1
+    merged.extend(extra)
+    return merged
+
+async def start_model_container(model_id: str, container_name: str, model_cfg: ModelConfig) -> ContainerState | None:
+    """Starts a new vLLM container using the model's resolved configuration."""
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
 
     # Clean up any existing container with the same name (from crashes or improper shutdowns)
@@ -575,14 +717,20 @@ async def start_model_container(model_id: str, container_name: str) -> Container
                 actual_model_path = actual_model_path.replace(HOST_CACHE_DIR, CONTAINER_CACHE_MOUNT, 1)
             logging.info(f"Container model path: {actual_model_path}")
 
-    # Only fetch and set max_model_len when the user has configured a global cap.
+    # Only fetch and set max_model_len when this model has a configured cap (> 0).
     # When no cap is set (0), let vLLM auto-detect the correct value for the model.
+    # The configured value is capped to the model's native max to avoid startup failures.
     final_max_len = 0
-    if VLLM_MAX_MODEL_LEN_GLOBAL > 0:
+    if model_cfg.max_model_len > 0:
         model_max_len = await get_model_max_len(tokenizer_repo if tokenizer_repo else model_id)
-        final_max_len = min(model_max_len, VLLM_MAX_MODEL_LEN_GLOBAL) if model_max_len > 0 else VLLM_MAX_MODEL_LEN_GLOBAL
+        final_max_len = min(model_max_len, model_cfg.max_model_len) if model_max_len > 0 else model_cfg.max_model_len
 
-    command = ["--model", actual_model_path, "--gpu-memory-utilization", VLLM_GPU_MEMORY_UTILIZATION]
+    # --- Build vLLM command from the resolved per-model config ---
+    # Always present: --model, --gpu-memory-utilization, --tensor-parallel-size.
+    command = ["--model", actual_model_path,
+               "--gpu-memory-utilization", str(model_cfg.gpu_memory_utilization)]
+    if model_cfg.tensor_parallel_size > 0:
+        command.extend(["--tensor-parallel-size", str(model_cfg.tensor_parallel_size)])
 
     # Add GGUF-specific parameters if this is a GGUF model
     if is_gguf_model(actual_model_path) or tokenizer_repo:
@@ -606,14 +754,19 @@ async def start_model_container(model_id: str, container_name: str) -> Container
             else:
                 logging.warning(f"No valid tokenizer found for GGUF model {model_id}. Using model's embedded tokenizer.")
 
+    # Conditional config-driven flags.
     if final_max_len > 0:
         command.extend(["--max-model-len", str(final_max_len)])
 
+    if model_cfg.quantization:
+        command.extend(["--quantization", model_cfg.quantization])
+
+    if model_cfg.dtype and model_cfg.dtype != "auto":
+        command.extend(["--dtype", model_cfg.dtype])
+
+    # Preserved global flag (not part of the per-model schema; override via extra_args).
     if int(VLLM_MAX_NUM_SEQS) > 0:
         command.extend(["--max-num-seqs", VLLM_MAX_NUM_SEQS])
-
-    if int(VLLM_TENSOR_PARALLEL_SIZE) > 0:
-        command.extend(["--tensor-parallel-size", VLLM_TENSOR_PARALLEL_SIZE])
 
     # Add gpt-oss specific optimizations for Ampere/Ada GPUs (RTX 3090, A100, etc)
     if is_gpt_oss_model(model_id):
@@ -622,6 +775,10 @@ async def start_model_container(model_id: str, container_name: str) -> Container
 
     if VLLM_ENFORCE_EAGER or VLLM_NO_CUDAGRAPH:
         command.append("--enforce-eager")
+
+    # Append raw per-model extra_args verbatim; explicit values override generated flags.
+    if model_cfg.extra_args:
+        command = merge_extra_args(command, model_cfg.extra_args)
 
     try:
         vllm_image = get_vllm_image_for_model(model_id)
@@ -641,7 +798,7 @@ async def start_model_container(model_id: str, container_name: str) -> Container
                 "VLLM_CACHE_BUST": str(uuid.uuid4()),
             },
             ipc_mode="host",
-            device_requests=[DeviceRequest(count=-1, capabilities=[['gpu']])],
+            device_requests=GPU_DEVICE_REQUESTS,
             volumes={
                 HOST_CACHE_DIR: {'bind': '/root/.cache/huggingface', 'mode': 'rw'},
                 VLLM_TEMP_DIR: {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
@@ -698,7 +855,10 @@ async def start_model_container(model_id: str, container_name: str) -> Container
                         ip_address=ip_address,
                         port=VLLM_PORT,
                         last_request_time=time.time(),
-                        vram_footprint=0 # Footprint is unknown until measured
+                        vram_footprint=0, # Footprint is unknown until measured
+                        always_on=model_cfg.always_on,
+                        inactivity_timeout=model_cfg.inactivity_timeout,
+                        loaded_at=time.time(),
                     )
                 elif response.status_code != 503:
                     # 503 is expected during vLLM initialization; anything else is worth noting
@@ -767,6 +927,7 @@ async def proxy_request(request: Request):
         return JSONResponse({"error": f"Model not allowed. Please choose from: {list(ALLOWED_MODELS.keys())}"}, status_code=400)
 
     target_model_id = ALLOWED_MODELS[model_name]
+    model_cfg = MODEL_CONFIGS[model_name]
 
     # Initialize semaphore for this model if not exists
     if target_model_id not in model_semaphores:
@@ -856,13 +1017,16 @@ async def proxy_request(request: Request):
                             # DISCOVERY RUN
                             logging.info(f"Unknown footprint for {target_model_id}. Starting a discovery run.")
 
-                            # Check and stop containers with lock
+                            # Stop active containers to isolate the measurement, but never an
+                            # always_on model. Leaving an always_on model resident is safe for the
+                            # footprint delta (it's present in both the before and after samples, so
+                            # it cancels out); it only reduces headroom for the discovery load.
                             async with model_management_lock:
-                                if active_containers:
-                                    logging.info("Stopping all active containers for discovery run.")
-                                    container_names_to_stop = list(active_containers.keys())
-                                else:
-                                    container_names_to_stop = []
+                                container_names_to_stop = [
+                                    name for name, c in active_containers.items() if not c.always_on
+                                ]
+                                if container_names_to_stop:
+                                    logging.info(f"Stopping {len(container_names_to_stop)} container(s) for discovery run (always_on kept).")
 
                             # Stop containers outside lock (I/O operation)
                             for name in container_names_to_stop:
@@ -873,7 +1037,7 @@ async def proxy_request(request: Request):
 
                             container_name = f"{VLLM_CONTAINER_PREFIX}_0"
                             # Start container outside lock (long I/O operation)
-                            target_container = await start_model_container(target_model_id, container_name)
+                            target_container = await start_model_container(target_model_id, container_name, model_cfg)
 
                             if target_container:
                                 # Wait for model to fully load into VRAM and take multiple measurements
@@ -914,17 +1078,24 @@ async def proxy_request(request: Request):
                             # Calculate VRAM and determine evictions with lock
                             async with model_management_lock:
                                 current_vram_usage = sum(c.vram_footprint for c in active_containers.values())
-                                containers_to_evict = []
 
-                                if current_vram_usage + footprint > TOTAL_GPU_VRAM:
-                                    logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). Evicting LRU containers.")
-                                    # Determine which containers to evict
-                                    sorted_containers = sorted(active_containers.values(), key=lambda c: c.last_request_time)
-                                    for container_to_evict in sorted_containers:
-                                        containers_to_evict.append(container_to_evict.container_name)
-                                        current_vram_usage -= container_to_evict.vram_footprint
-                                        if current_vram_usage + footprint <= TOTAL_GPU_VRAM:
-                                            break
+                                # Guarded LRU eviction: never evict always_on or in-flight models,
+                                # prefer models past the anti-thrash cooldown (see placement.select_evictions).
+                                containers_to_evict = placement.select_evictions(
+                                    residents=list(active_containers.values()),
+                                    needed=footprint,
+                                    total_vram=TOTAL_GPU_VRAM,
+                                    current_usage=current_vram_usage,
+                                    now=time.time(),
+                                    min_resident_seconds=GATEWAY_MIN_RESIDENT_SECONDS,
+                                )
+                                if containers_to_evict:
+                                    freed = sum(active_containers[n].vram_footprint for n in containers_to_evict)
+                                    logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). "
+                                                 f"Evicting {len(containers_to_evict)} idle container(s) to free ~{freed} MiB: {containers_to_evict}")
+                                    if current_vram_usage - freed + footprint > TOTAL_GPU_VRAM:
+                                        logging.warning(f"Could not free enough VRAM for {target_model_id} without evicting "
+                                                        f"always_on/in-flight models; starting best-effort (may contend for VRAM).")
 
                                 # Find a free slot index
                                 slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
@@ -936,7 +1107,7 @@ async def proxy_request(request: Request):
                                 await stop_container(name)
 
                             # Start container outside lock (long I/O operation)
-                            target_container = await start_model_container(target_model_id, container_name)
+                            target_container = await start_model_container(target_model_id, container_name, model_cfg)
                             if target_container:
                                 target_container.vram_footprint = footprint
                                 # Update active_containers with lock
@@ -960,7 +1131,7 @@ async def proxy_request(request: Request):
 
                             container_name = f"{VLLM_CONTAINER_PREFIX}_0"
                             # Start container outside lock (long I/O operation)
-                            target_container = await start_model_container(target_model_id, container_name)
+                            target_container = await start_model_container(target_model_id, container_name, model_cfg)
                             if target_container:
                                 # Update active_containers with lock
                                 async with model_management_lock:

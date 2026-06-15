@@ -1,0 +1,42 @@
+# vLLM Gateway — per-model configuration
+# ---------------------------------------
+# Copy to config/models.yaml (the gateway reads MODELS_CONFIG_FILE, default
+# /app/config/models.yaml, mounted from ./config). When this file is present it
+# REPLACES the legacy ALLOWED_MODELS_JSON env var. If it is absent, the gateway
+# falls back to ALLOWED_MODELS_JSON with the old global env-var settings.
+#
+# Resolution precedence per setting:
+#   per-model entry  >  defaults block  >  built-in default (the old env var)
+
+defaults:                      # optional; applied to every model unless overridden
+  gpu_memory_utilization: 0.90 # 0 < x <= 1
+  max_model_len: 0             # 0 = use the model's native max (omit the flag)
+  tensor_parallel_size: 1
+  quantization: null           # awq | gptq | fp8 | null
+  dtype: auto                  # auto | float16 | bfloat16 | ...
+  inactivity_timeout: 1800     # seconds of idleness before unload; 0 = never unload
+  always_on: false             # if true, never auto-unloaded
+  extra_args: []               # raw vLLM CLI args, appended verbatim (override generated flags)
+
+models:                        # required, non-empty
+  # A small instruct model on its native context length.
+  gemma3-4B:
+    repo: google/gemma-3-4b-it
+
+  # An AWQ-quantized model.
+  qwen3-30b-awq:
+    repo: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+    quantization: awq
+
+  # A model pinned to a custom (capped) context length and a couple of extra flags.
+  qwen2.5-coder:
+    repo: Qwen/Qwen2.5-Coder-7B-Instruct
+    max_model_len: 16384
+    extra_args:
+      - "--enable-prefix-caching"
+
+  # An always-on embedding model that is never unloaded by the inactivity monitor.
+  bge-m3:
+    repo: BAAI/bge-m3
+    always_on: true
+    inactivity_timeout: 0
