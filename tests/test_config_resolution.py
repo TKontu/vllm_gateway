@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
 from config_loader import (  # noqa: E402
     resolve_model_configs, build_fallback_configs, resolve_pools,
-    validate_model_pools, validate_tp_against_pools,
+    validate_model_pools, validate_tp_against_pools, validate_colocate,
 )
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
@@ -27,6 +27,7 @@ BUILTINS = {
     "always_on": False,
     "extra_args": [],
     "pool": None,
+    "colocate": False,
 }
 
 
@@ -228,6 +229,36 @@ def test_validate_tp_against_pools():
     # no pools declared -> never raises on tp
     validate_tp_against_pools(bad, {})
     print("ok: validate_tp_against_pools")
+
+
+def test_colocate_field_and_validation():
+    # default false; override true; precedence via defaults
+    cfgs = resolve_model_configs(
+        {"defaults": {"colocate": True}, "models": {"a": {"repo": "o/a"}, "b": {"repo": "o/b", "colocate": False}}},
+        BUILTINS)
+    assert cfgs["a"].colocate is True and cfgs["b"].colocate is False
+    # non-bool rejected
+    try:
+        resolve_model_configs({"models": {"m": {"repo": "o/m", "colocate": "yes"}}}, BUILTINS)
+    except ValueError as e:
+        assert "colocate" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for non-bool colocate")
+    print("ok: colocate field + type validation")
+
+
+def test_validate_colocate_forbids_tp():
+    ok = resolve_model_configs({"models": {"m": {"repo": "o/m", "colocate": True}}}, BUILTINS)
+    validate_colocate(ok)  # tp defaults to 1 -> fine
+    bad = resolve_model_configs(
+        {"models": {"m": {"repo": "o/m", "colocate": True, "tensor_parallel_size": 2}}}, BUILTINS)
+    try:
+        validate_colocate(bad)
+    except ValueError as e:
+        assert "incompatible" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for colocate + tp>1")
+    print("ok: validate_colocate forbids TP")
 
 
 if __name__ == "__main__":

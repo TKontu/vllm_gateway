@@ -13,8 +13,10 @@
 # full UUIDs from `nvidia-smi -L`. A model is placed on a GPU within its pool.
 #   - If 'pools' is omitted, the gateway runs single-pool: the GATEWAY_GPU_UUID
 #     pin if set, else all visible GPUs (unchanged legacy behavior).
-#   - Each model gets ~its whole GPU at its gpu_memory_utilization (whole-card
-#     placement); multi-model co-location is not yet supported.
+#   - By default each model gets ~its whole GPU at its gpu_memory_utilization
+#     (whole-card placement). Set colocate: true to let small models SHARE a card
+#     (their gpu_memory_utilization is their per-card share; co-locatable models only
+#     share with each other; single-GPU only — not combinable with tensor parallel).
 #   - Tensor-parallel (tensor_parallel_size > 1) spreads ONE model across several
 #     GPUs of its pool. TP requires a HOMOGENEOUS pool (equal-VRAM cards) — never
 #     mix a 3090 and an A2000. TP over PCIe (no NVLink) has real comms cost, so use
@@ -64,6 +66,21 @@ models:                        # required, non-empty
     repo: Qwen/Qwen2.5-3B-Instruct
     pool: util
     gpu_memory_utilization: 0.45   # leave headroom for the external embedder on the A2000
+
+  # Two small models that SHARE one 3090 via co-location. Each asks for ~45% of the card
+  # (sum ~0.9 fits one 24 GB GPU); the gateway caps the launch util to actual free space so
+  # the second never OOMs the first. colocate models pack together and are evicted only as
+  # needed. Good for several small helpers that are each lightly used.
+  guard-small:
+    repo: meta-llama/Llama-Guard-3-1B
+    pool: llm
+    colocate: true
+    gpu_memory_utilization: 0.45
+  rewriter-small:
+    repo: Qwen/Qwen2.5-1.5B-Instruct
+    pool: llm
+    colocate: true
+    gpu_memory_utilization: 0.45
 
   # A large model forced across both 3090s with tensor parallel. tensor_parallel_size must
   # not exceed the GPUs declared in the pool (validated at startup), and the pool must be

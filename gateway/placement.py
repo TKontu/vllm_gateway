@@ -202,3 +202,39 @@ def select_placement(candidates, residents_by_gpu, needed_per_gpu, tp, now, min_
     # Dedupe eviction names (a multi-GPU/TP resident can appear on several chosen GPUs).
     evictions = list(dict.fromkeys(n for o in chosen for n in o[3]))
     return chosen_uuids, evictions
+
+
+def select_colocated(candidates, residents_by_gpu, needed, now, min_resident_seconds):
+    """Choose a GPU for a co-locatable model that may SHARE a card with other co-locatable models.
+
+    Returns (chosen_uuid | None, eviction_names). Single GPU.
+
+    A GPU is eligible only if it is empty or every resident on it is itself co-locatable
+    (a co-locatable model never shares with a whole-card model). Among eligible GPUs: direct fit
+    (free >= needed) most-free first; else evict idle co-residents guarded-LRU *only as much as
+    needed* (reuse _gpu_fit_cost — it stops once `needed` fits, so co-residents are kept when
+    possible); else None (caller 503s).
+    """
+    eligible = [
+        g for g in candidates
+        if all(getattr(r, "colocate", False) for r in residents_by_gpu.get(g.uuid, []))
+    ]
+
+    # 1. Direct fit, most-free first.
+    direct = [g for g in eligible if g.free >= needed]
+    if direct:
+        return max(direct, key=lambda g: g.free).uuid, []
+
+    # 2. Partial guarded eviction of idle co-residents.
+    options = []  # (num_evictions, -resulting_free, uuid, eviction_names)
+    for g in eligible:
+        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), needed, now, min_resident_seconds)
+        if cost is not None:
+            num_ev, resulting_free, ev = cost
+            options.append((num_ev, -resulting_free, g.uuid, ev))
+
+    if not options:
+        return None, []
+    options.sort()
+    _, _, uuid, evictions = options[0]
+    return uuid, evictions

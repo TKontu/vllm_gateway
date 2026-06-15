@@ -22,6 +22,7 @@ ALLOWED_CONFIG_KEYS = {
     "always_on",
     "extra_args",
     "pool",  # name of the GPU pool this model is placed in (multi-GPU); None = default pool
+    "colocate",  # if true, may share a GPU with other co-locatable models (Phase 3)
 }
 
 # Per-model entries additionally require/allow "repo".
@@ -44,6 +45,7 @@ class ModelConfig:
     always_on: bool
     extra_args: list
     pool: Optional[str]  # GPU pool name (multi-GPU placement); None = the default/implicit pool
+    colocate: bool  # may share a GPU with other co-locatable models (Phase 3)
 
 
 def _require_int(field: str, model: str, value):
@@ -95,6 +97,10 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
     if pool is not None and (not isinstance(pool, str) or not pool.strip()):
         raise ValueError(f"model '{name}': 'pool' must be a non-empty string or null, got {pool!r}")
 
+    colocate = merged["colocate"]
+    if not isinstance(colocate, bool):
+        raise ValueError(f"model '{name}': 'colocate' must be a boolean, got {colocate!r}")
+
     return ModelConfig(
         name=name,
         repo=repo,
@@ -108,6 +114,7 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
         # Fresh list of strings; never share the builtins/defaults list across models.
         extra_args=[str(a) for a in extra_args],
         pool=pool.strip() if isinstance(pool, str) else None,
+        colocate=colocate,
     )
 
 
@@ -249,3 +256,26 @@ def validate_tp_against_pools(configs: "dict[str, ModelConfig]", pools: "dict[st
                     f"model '{name}': tensor_parallel_size={cfg.tensor_parallel_size} exceeds the "
                     f"{available} GPU(s) declared in pool '{cfg.pool}'"
                 )
+
+
+def validate_colocate(configs: "dict[str, ModelConfig]", max_share: float = 0.9) -> None:
+    """Validate co-location settings. Raises on a hard conflict; warns on a soft smell.
+
+    Co-location is single-GPU only, so it is incompatible with tensor parallel. A co-locatable
+    model whose share (gpu_memory_utilization) is near a whole card won't actually co-locate —
+    that's a config smell, logged as a warning, not an error.
+    """
+    import logging
+    for name, cfg in configs.items():
+        if not cfg.colocate:
+            continue
+        if cfg.tensor_parallel_size > 1:
+            raise ValueError(
+                f"model '{name}': colocate=true is incompatible with tensor_parallel_size="
+                f"{cfg.tensor_parallel_size} (co-location is single-GPU only)"
+            )
+        if cfg.gpu_memory_utilization > max_share:
+            logging.warning(
+                f"model '{name}': colocate=true but gpu_memory_utilization="
+                f"{cfg.gpu_memory_utilization} > {max_share}; it will rarely fit alongside another model."
+            )

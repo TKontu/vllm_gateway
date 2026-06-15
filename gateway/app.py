@@ -18,7 +18,7 @@ import yaml
 import placement
 from config_loader import (
     ModelConfig, resolve_model_configs, build_fallback_configs,
-    resolve_pools, validate_model_pools, validate_tp_against_pools,
+    resolve_pools, validate_model_pools, validate_tp_against_pools, validate_colocate,
 )
 
 # --- Logging Configuration ---
@@ -65,6 +65,13 @@ GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max c
 # becomes a candidate for eviction-to-make-room. Eviction falls back to fresh models only if no
 # older candidate frees enough VRAM (so a single-GPU swap is never blocked). 0 disables the cooldown.
 GATEWAY_MIN_RESIDENT_SECONDS = int(os.getenv("GATEWAY_MIN_RESIDENT_SECONDS", "90"))
+
+# Co-location (Phase 3): when a co-locatable model shares a card, its launch util is capped so it
+# leaves COLOCATE_MARGIN_MIB free; weights must fit util*total * COLOCATE_WEIGHT_OVERHEAD; a
+# colocate model whose share exceeds COLOCATE_MAX_SHARE is warned about at startup.
+COLOCATE_MARGIN_MIB = int(os.getenv("COLOCATE_MARGIN_MIB", "1024"))
+COLOCATE_WEIGHT_OVERHEAD = float(os.getenv("COLOCATE_WEIGHT_OVERHEAD", "1.15"))
+COLOCATE_MAX_SHARE = float(os.getenv("COLOCATE_MAX_SHARE", "0.9"))
 
 # Timeout configuration (in seconds)
 GATEWAY_REQUEST_TIMEOUT = int(os.getenv("GATEWAY_REQUEST_TIMEOUT", "300"))  # Total request timeout (default 5 minutes)
@@ -149,6 +156,7 @@ class ContainerState:
     inactivity_timeout: int = VLLM_INACTIVITY_TIMEOUT  # per-model idle timeout (seconds; 0 = never unload)
     loaded_at: float = 0.0  # time.time() when the container became ready (for anti-thrash cooldown)
     gpu_uuids: list = field(default_factory=list)  # GPU UUID(s) this container is pinned to
+    colocate: bool = False  # may share its GPU with other co-locatable models (Phase 3)
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
@@ -539,6 +547,7 @@ def builtin_model_defaults() -> dict:
         "always_on": False,
         "extra_args": [],
         "pool": None,
+        "colocate": False,
     }
 
 def load_model_configs() -> "tuple[dict, dict]":
@@ -561,6 +570,7 @@ def load_model_configs() -> "tuple[dict, dict]":
         pools = resolve_pools(raw)
         validate_model_pools(configs, pools)  # fail fast on a model referencing an undeclared pool
         validate_tp_against_pools(configs, pools)  # fail fast if tensor_parallel_size > pool GPU count
+        validate_colocate(configs, COLOCATE_MAX_SHARE)  # fail fast on colocate+TP; warn on high share
         logging.info(f"Loaded {len(configs)} model(s) from {MODELS_CONFIG_FILE}: {list(configs)}")
         if pools:
             logging.info(f"Declared GPU pools: { {p: len(u) for p, u in pools.items()} }")
@@ -729,14 +739,17 @@ def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
 
 async def start_model_container(model_id: str, container_name: str, model_cfg: ModelConfig,
                                 gpu_uuids: "list[str] | None" = None,
-                                effective_tp: "int | None" = None) -> ContainerState | None:
+                                effective_tp: "int | None" = None,
+                                effective_util: "float | None" = None) -> ContainerState | None:
     """Starts a new vLLM container using the model's resolved configuration.
 
     gpu_uuids pins the container to specific GPU(s) (multi-GPU placement). When None/empty,
     falls back to GPU_DEVICE_REQUESTS (the gateway-wide pin or all GPUs) for backward compat.
-    effective_tp overrides --tensor-parallel-size (for TP fallback); defaults to the model's
-    configured tensor_parallel_size. model_cfg is never mutated (it is shared across requests)."""
+    effective_tp overrides --tensor-parallel-size (for TP fallback); effective_util overrides
+    --gpu-memory-utilization (for co-location). Both default to the model's configured values.
+    model_cfg is never mutated (it is shared across requests)."""
     tp = effective_tp if effective_tp else model_cfg.tensor_parallel_size
+    util = effective_util if effective_util is not None else model_cfg.gpu_memory_utilization
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
 
     # Clean up any existing container with the same name (from crashes or improper shutdowns)
@@ -815,7 +828,7 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
     # --- Build vLLM command from the resolved per-model config ---
     # Always present: --model, --gpu-memory-utilization, --tensor-parallel-size.
     command = ["--model", actual_model_path,
-               "--gpu-memory-utilization", str(model_cfg.gpu_memory_utilization)]
+               "--gpu-memory-utilization", str(round(util, 4))]
     if tp > 0:
         command.extend(["--tensor-parallel-size", str(tp)])
 
@@ -953,6 +966,7 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
                         inactivity_timeout=model_cfg.inactivity_timeout,
                         loaded_at=time.time(),
                         gpu_uuids=list(gpu_uuids) if gpu_uuids else [],
+                        colocate=model_cfg.colocate,
                     )
                 elif response.status_code != 503:
                     # 503 is expected during vLLM initialization; anything else is worth noting
@@ -1136,27 +1150,37 @@ async def proxy_request(request: Request):
                             # Snapshot per-GPU VRAM OUTSIDE the placement lock (it spawns a container).
                             gpus_snapshot = await get_gpu_vram()
 
-                            # Per-card need (whole-card model: independent of TP degree).
-                            if footprint and footprint > 0:
+                            pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
+                            max_total = max(pool_totals) if pool_totals else 0.0
+                            is_colocate = model_cfg.colocate
+
+                            # Per-card need. Co-locatable models use their intended share (so several pack
+                            # onto a card); whole-card models use the learned footprint or a full-card estimate.
+                            if is_colocate:
+                                needed_per_gpu = model_cfg.gpu_memory_utilization * max_total
+                            elif footprint and footprint > 0:
                                 needed_per_gpu = float(footprint)
                             else:
-                                pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
-                                needed_per_gpu = model_cfg.gpu_memory_utilization * (max(pool_totals) if pool_totals else 0.0)
+                                needed_per_gpu = model_cfg.gpu_memory_utilization * max_total
 
-                            # Effective TP: forced by config, or auto-fallback for an unseen model whose
-                            # weights exceed one card (only in a homogeneous, multi-GPU pool).
+                            # Effective TP: forced by config, or auto-fallback for an unseen (non-colocate)
+                            # model whose weights exceed one card (only in a homogeneous, multi-GPU pool).
                             effective_tp = model_cfg.tensor_parallel_size
-                            if (is_discovery and model_cfg.tensor_parallel_size == 1 and len(pool_gpus) >= 2):
-                                pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
-                                if pool_totals and (max(pool_totals) - min(pool_totals)) <= 0.05 * max(pool_totals):
-                                    wbytes = await estimate_weight_bytes(target_model_id)
-                                    min_tp = placement.minimal_tp_to_fit(
-                                        wbytes, max(pool_totals), model_cfg.gpu_memory_utilization, pool_size=len(pool_gpus))
-                                    if min_tp > effective_tp:
-                                        logging.info(f"TP fallback for {target_model_id}: weights ~{wbytes} B -> tp={min_tp}")
-                                        effective_tp = min_tp
+                            if (is_discovery and not is_colocate and model_cfg.tensor_parallel_size == 1
+                                    and len(pool_gpus) >= 2
+                                    and pool_totals and (max(pool_totals) - min(pool_totals)) <= 0.05 * max(pool_totals)):
+                                wbytes = await estimate_weight_bytes(target_model_id)
+                                min_tp = placement.minimal_tp_to_fit(
+                                    wbytes, max_total, model_cfg.gpu_memory_utilization, pool_size=len(pool_gpus))
+                                if min_tp > effective_tp:
+                                    logging.info(f"TP fallback for {target_model_id}: weights ~{wbytes} B -> tp={min_tp}")
+                                    effective_tp = min_tp
+
+                            # Co-location needs a weight estimate to size the launch util safely (best-effort).
+                            colocate_wbytes = await estimate_weight_bytes(target_model_id) if is_colocate else None
 
                             # --- DECIDE: choose GPU(s) + reserve, under the global placement lock ---
+                            effective_util = None
                             async with model_management_lock:
                                 async with placement_lock:
                                     candidates = []
@@ -1173,50 +1197,80 @@ async def proxy_request(request: Request):
                                             ready_footprint=sum(c.vram_footprint for c in residents),
                                         ))
 
-                                    chosen_uuids, evictions = placement.select_placement(
-                                        candidates, residents_by_gpu, needed_per_gpu, effective_tp,
-                                        time.time(), GATEWAY_MIN_RESIDENT_SECONDS,
-                                    )
+                                    if is_colocate:
+                                        uuid, evictions = placement.select_colocated(
+                                            candidates, residents_by_gpu, needed_per_gpu,
+                                            time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
+                                        chosen_uuids = [uuid] if uuid is not None else None
+                                    else:
+                                        chosen_uuids, evictions = placement.select_placement(
+                                            candidates, residents_by_gpu, needed_per_gpu, effective_tp,
+                                            time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
                                     if chosen_uuids is None:
                                         raise HTTPException(
                                             status_code=503,
-                                            detail=(f"Cannot place model {target_model_id} in pool '{pool}' at tp={effective_tp} "
-                                                    f"(~{int(needed_per_gpu)} MiB/GPU): pool not homogeneous, has too few GPUs, "
-                                                    f"or no {effective_tp} GPU(s) free without evicting always_on/in-flight models. Retry later."))
+                                            detail=(f"Cannot place model {target_model_id} in pool '{pool}' "
+                                                    f"({'colocate' if is_colocate else f'tp={effective_tp}'}, ~{int(needed_per_gpu)} MiB/GPU): "
+                                                    f"no GPU available without evicting always_on/in-flight models "
+                                                    f"(or pool not homogeneous / too few GPUs for TP). Retry later."))
+
+                                    # Co-location: size the launch util from the chosen card's free space
+                                    # (after this model's evictions), capped by the configured share and a margin.
+                                    chosen_gv = next(c for c in candidates if c.uuid == chosen_uuids[0])
+                                    if is_colocate:
+                                        freed = sum(r.vram_footprint for r in residents_by_gpu[chosen_uuids[0]]
+                                                    if r.container_name in evictions)
+                                        post_free = chosen_gv.free + freed
+                                        total = chosen_gv.total or max_total
+                                        budget = max(0.0, post_free - COLOCATE_MARGIN_MIB)
+                                        effective_util = min(model_cfg.gpu_memory_utilization,
+                                                             (budget / total) if total > 0 else model_cfg.gpu_memory_utilization)
+                                        # Weights floor: refuse a budget that can't hold the weights (would OOM).
+                                        if colocate_wbytes:
+                                            need_mib = (colocate_wbytes / (1024.0 * 1024.0)) * COLOCATE_WEIGHT_OVERHEAD
+                                            if effective_util * total < need_mib:
+                                                raise HTTPException(
+                                                    status_code=503,
+                                                    detail=(f"Cannot co-locate {target_model_id} on {chosen_uuids[0]}: budget "
+                                                            f"~{int(effective_util * total)} MiB < weights ~{int(need_mib)} MiB. Retry later."))
+                                        reserve_amt = effective_util * total
+                                    else:
+                                        reserve_amt = needed_per_gpu
 
                                     for u in chosen_uuids:
-                                        gpu_reservations[u] = gpu_reservations.get(u, 0.0) + needed_per_gpu
+                                        gpu_reservations[u] = gpu_reservations.get(u, 0.0) + reserve_amt
                                     slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
                                     free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
                                     container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
-                                    logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', tp={effective_tp}, "
-                                                 f"~{int(needed_per_gpu)} MiB/GPU); evicting {evictions or 'nothing'}; slot {container_name}.")
+                                    logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', "
+                                                 f"{'colocate util=%.3f' % effective_util if is_colocate else 'tp=%d' % effective_tp}, "
+                                                 f"~{int(reserve_amt)} MiB/GPU); evicting {evictions or 'nothing'}; slot {container_name}.")
 
                             # --- Evictions + start happen OUTSIDE the locks (I/O) ---
                             for name in evictions:
                                 await stop_container(name)
 
-                            before_used = gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0) if is_discovery else 0.0
+                            # Discovery (whole-card models only): measure the per-GPU footprint delta.
+                            run_discovery = is_discovery and not is_colocate
+                            before_used = gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0) if run_discovery else 0.0
 
                             try:
                                 target_container = await start_model_container(
                                     target_model_id, container_name, model_cfg,
-                                    gpu_uuids=chosen_uuids, effective_tp=effective_tp)
+                                    gpu_uuids=chosen_uuids, effective_tp=effective_tp, effective_util=effective_util)
                                 if target_container:
-                                    # Seed footprint with the estimate so concurrent placement counts these
-                                    # GPU(s) as occupied immediately; discovery refines it just below.
-                                    target_container.vram_footprint = needed_per_gpu
+                                    # Seed footprint so concurrent placement counts these GPU(s) as occupied.
+                                    # Co-location: deterministic (vLLM grabs ~util*total). Whole-card: refined by discovery.
+                                    target_container.vram_footprint = reserve_amt
                                     async with model_management_lock:
                                         active_containers[container_name] = target_container
                             finally:
-                                # Always release the optimistic reservation on ALL chosen GPUs (model is now
-                                # resident-and-counted on success, or never loaded on failure).
+                                # Always release the optimistic reservation on ALL chosen GPUs.
                                 async with placement_lock:
                                     for u in chosen_uuids:
-                                        gpu_reservations[u] = max(0.0, gpu_reservations.get(u, 0.0) - needed_per_gpu)
+                                        gpu_reservations[u] = max(0.0, gpu_reservations.get(u, 0.0) - reserve_amt)
 
-                            # Discovery: measure the per-GPU footprint on one chosen GPU (homogeneous + symmetric under TP).
-                            if target_container and is_discovery:
+                            if target_container and run_discovery:
                                 meas_gpu = chosen_uuids[0]
                                 logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
                                 samples = []
