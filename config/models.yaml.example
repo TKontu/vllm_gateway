@@ -41,7 +41,9 @@ defaults:                      # optional; applied to every model unless overrid
   dtype: auto                  # auto | float16 | bfloat16 | ...
   inactivity_timeout: 1800     # seconds of idleness before unload; 0 = never unload
   always_on: false             # if true, never auto-unloaded
-  extra_args: []               # raw vLLM CLI args, appended verbatim (override generated flags)
+  extra_args: []               # raw vLLM CLI args, appended verbatim. NOTE: --model,
+                               # --gpu-memory-utilization and --tensor-parallel-size are
+                               # gateway-managed (set from placement) and ignored here if present.
 
 models:                        # required, non-empty
   # A small instruct model on its native context length (default pool: llm).

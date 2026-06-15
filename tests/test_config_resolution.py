@@ -14,6 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 from config_loader import (  # noqa: E402
     resolve_model_configs, build_fallback_configs, resolve_pools,
     validate_model_pools, validate_tp_against_pools, validate_colocate,
+    validate_pools_visible,
 )
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
@@ -259,6 +260,19 @@ def test_validate_colocate_forbids_tp():
     else:
         raise AssertionError("expected ValueError for colocate + tp>1")
     print("ok: validate_colocate forbids TP")
+
+
+def test_validate_pools_visible():
+    pools = {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}
+    validate_pools_visible(pools, {"GPU-a", "GPU-b", "GPU-c", "GPU-x"})  # all present -> ok
+    validate_pools_visible({}, set())  # no pools -> ok
+    try:
+        validate_pools_visible(pools, {"GPU-a", "GPU-c"})  # GPU-b missing
+    except ValueError as e:
+        assert "GPU-b" in str(e) and "not visible" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for a missing UUID")
+    print("ok: validate_pools_visible")
 
 
 if __name__ == "__main__":

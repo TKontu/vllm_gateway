@@ -19,6 +19,7 @@ import placement
 from config_loader import (
     ModelConfig, resolve_model_configs, build_fallback_configs,
     resolve_pools, validate_model_pools, validate_tp_against_pools, validate_colocate,
+    validate_pools_visible,
 )
 
 # --- Logging Configuration ---
@@ -49,8 +50,9 @@ VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 MODELS_CONFIG_FILE = os.getenv("MODELS_CONFIG_FILE", "/app/config/models.yaml")
 
 # --- GPU Pinning ---
-# Optionally pin this gateway instance (and every vLLM container it launches) to a
-# single GPU by UUID. Leave unset to use all GPUs (default, unchanged behavior).
+# Optionally pin this gateway instance (and every vLLM container it launches) to a single GPU
+# by UUID. For multi-GPU, prefer a `pools:` section in the model config (which takes precedence
+# over this pin). Leave unset and with no pools to use all visible GPUs (legacy behavior).
 GATEWAY_GPU_UUID = os.getenv("GATEWAY_GPU_UUID", "").strip()
 if GATEWAY_GPU_UUID:
     GPU_DEVICE_REQUESTS = [DeviceRequest(device_ids=[GATEWAY_GPU_UUID], capabilities=[['gpu']])]
@@ -209,8 +211,12 @@ async def lifespan(_app: FastAPI):
         RESOLVED_DOCKER_NETWORK = DOCKER_NETWORK_NAME
         logging.error(f"Gateway container '{GATEWAY_CONTAINER_NAME}' not found. Falling back to network '{DOCKER_NETWORK_NAME}'.")
 
-    await get_total_vram()
+    await get_total_vram()  # probes ALL GPUs -> GPU_VRAM (independent of any pin)
     resolve_managed_pools()
+    # Fail fast if a configured pool/pin UUID isn't actually present (typo / moved card),
+    # rather than silently treating it as a 0-VRAM, unplaceable GPU.
+    if CONFIGURED_POOLS or GATEWAY_GPU_UUID:
+        validate_pools_visible(MANAGED_POOLS, set(GPU_VRAM.keys()))
     load_known_footprints()
     asyncio.create_task(shutdown_inactive_containers())
 
@@ -235,13 +241,10 @@ async def run_in_executor(func, *args, **kwargs):
 async def run_nvidia_smi_in_container(command: list[str]) -> str:
     """Runs an nvidia-smi command in a temporary container and returns the output.
 
-    The probe must see every GPU this gateway manages so per-GPU accounting is complete.
-    Once pools are resolved it requests exactly the managed set; before that (startup) it
-    falls back to GPU_DEVICE_REQUESTS (the GATEWAY_GPU_UUID pin, or all GPUs)."""
-    if MANAGED_GPUS:
-        probe_requests = [DeviceRequest(device_ids=list(MANAGED_GPUS), capabilities=[['gpu']])]
-    else:
-        probe_requests = GPU_DEVICE_REQUESTS
+    The probe always requests ALL GPUs (count=-1) and the caller filters to the managed set.
+    This keeps per-GPU accounting complete regardless of the GATEWAY_GPU_UUID pin (so pools
+    win over the pin), and avoids a single bad configured UUID erroring the whole probe."""
+    probe_requests = [DeviceRequest(count=-1, capabilities=[['gpu']])]
     try:
         smi_output = await run_in_executor(
             docker_client.containers.run,
@@ -341,6 +344,10 @@ def save_known_footprints():
     except IOError as e:
         logging.error(f"Could not save memory footprints file: {e}")
 
+async def save_known_footprints_async():
+    """Persist footprints off the event loop (blocking file I/O must not run on the loop)."""
+    await run_in_executor(save_known_footprints)
+
 async def get_used_vram() -> float:
     """Gets currently used GPU VRAM (MiB) across the managed GPU(s)."""
     gpus = await get_gpu_vram()
@@ -370,11 +377,11 @@ def resolve_managed_pools():
     MANAGED_GPUS = [u for uuids in MANAGED_POOLS.values() for u in uuids]
     logging.info(f"Managed GPU pools resolved from {source}: "
                  f"{ {p: u for p, u in MANAGED_POOLS.items()} }")
-    # Warn about configured UUIDs the probe can't see (typo / wrong host).
+    # Recompute the managed total from the resolved set so it reflects pools (which win over the
+    # pin), not whatever _managed_vram defaulted to before resolution.
+    global TOTAL_GPU_VRAM
     if GPU_VRAM:
-        unseen = [u for u in MANAGED_GPUS if u not in GPU_VRAM]
-        if unseen:
-            logging.warning(f"Configured GPU UUID(s) not visible to nvidia-smi: {unseen}")
+        TOTAL_GPU_VRAM = int(sum(GPU_VRAM[u]["total"] for u in MANAGED_GPUS if u in GPU_VRAM))
 
 def pool_for(model_cfg) -> str:
     """The pool a model belongs to: its configured pool, else the default/implicit pool."""
@@ -709,14 +716,38 @@ async def estimate_weight_bytes(model_id: str) -> "int | None":
         logging.warning(f"Could not estimate weight size for {model_id}: {e}")
     return None
 
+# Flags the gateway computes from placement (util cap, TP degree, model path). A model's
+# extra_args must NOT override these — doing so would defeat the co-location budget or the
+# pool-validated tensor-parallel degree. They are dropped (with a warning) if present.
+GATEWAY_MANAGED_FLAGS = {"--gpu-memory-utilization", "--tensor-parallel-size", "--model"}
+
 def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
-    """Append raw extra_args verbatim, letting them override any flag the base set.
+    """Append raw extra_args, letting them override any NON-managed flag the base set.
 
     Any '--flag' present in extra_args removes the gateway-generated occurrence of that
     flag (and its following value, if any) from base, so the explicit config value wins
-    and no flag is duplicated.
+    and no flag is duplicated — except GATEWAY_MANAGED_FLAGS, which the gateway owns and
+    which are stripped from extra_args (with a warning) so placement decisions stand.
     """
     extra = [str(a) for a in extra]
+
+    # Strip gateway-managed flags (and their values) from extra_args.
+    cleaned = []
+    i = 0
+    while i < len(extra):
+        tok = extra[i]
+        if tok in GATEWAY_MANAGED_FLAGS:
+            logging.warning(f"Ignoring gateway-managed flag '{tok}' in extra_args "
+                            f"(it is set from placement and cannot be overridden).")
+            if i + 1 < len(extra) and not extra[i + 1].startswith("--"):
+                i += 2
+            else:
+                i += 1
+            continue
+        cleaned.append(tok)
+        i += 1
+    extra = cleaned
+
     extra_flags = {tok for tok in extra if tok.startswith("--")}
     if not extra_flags:
         return base + extra
@@ -1001,34 +1032,49 @@ def list_models():
     return {"data": [{"id": name} for name in ALLOWED_MODELS.keys()], "object": "list"}
 
 @app.get("/gateway/status")
-def gateway_status():
-    """Returns the current status of the gateway and its managed containers."""
-    # Per-GPU view: which pool each managed GPU is in, its residents, and reservation.
-    uuid_to_pool = {u: p for p, uuids in MANAGED_POOLS.items() for u in uuids}
+async def gateway_status():
+    """Returns the current status of the gateway and its managed containers.
+
+    Snapshots the shared state under the locks that guard it, then builds the response from
+    the copies — so a concurrent mutation can't raise 'dict changed size during iteration'
+    (this endpoint runs in a threadpool, truly concurrent with the event loop)."""
+    async with model_management_lock:
+        async with placement_lock:
+            containers = {name: dict(state.__dict__) for name, state in active_containers.items()}
+            reservations = dict(gpu_reservations)
+        gpu_vram = {u: dict(v) for u, v in GPU_VRAM.items()}
+        pools = {p: list(u) for p, u in MANAGED_POOLS.items()}
+        footprints = dict(known_footprints)
+        managed = list(MANAGED_GPUS)
+    async with queue_count_lock:
+        queue_counts = dict(model_queue_counts)
+
+    uuid_to_pool = {u: p for p, uuids in pools.items() for u in uuids}
     gpus_status = {}
-    for guid in MANAGED_GPUS:
-        v = GPU_VRAM.get(guid, {})
-        residents = [c.container_name for c in active_containers.values() if guid in c.gpu_uuids]
+    for guid in managed:
+        v = gpu_vram.get(guid, {})
+        residents = [c["container_name"] for c in containers.values() if guid in c.get("gpu_uuids", [])]
         gpus_status[guid] = {
             "pool": uuid_to_pool.get(guid),
             "total_mib": v.get("total"),
             "used_mib": v.get("used"),
-            "reserved_mib": gpu_reservations.get(guid, 0.0),
+            "reserved_mib": reservations.get(guid, 0.0),
             "residents": residents,
         }
+    model_ids = set(list(queue_counts.keys()) + [c["model_id"] for c in containers.values()])
     return {
         "total_gpu_vram_mib": TOTAL_GPU_VRAM,
-        "pools": MANAGED_POOLS,
+        "pools": pools,
         "gpus": gpus_status,
-        "known_footprints_mib": known_footprints,
-        "active_containers": {name: state.__dict__ for name, state in active_containers.items()},
+        "known_footprints_mib": footprints,
+        "active_containers": containers,
         "queue_status": {
             model_id: {
-                "queue_depth": model_queue_counts.get(model_id, 0),
+                "queue_depth": queue_counts.get(model_id, 0),
                 "max_concurrent": GATEWAY_MAX_CONCURRENT,
                 "max_queue_size": GATEWAY_MAX_QUEUE_SIZE
             }
-            for model_id in set(list(model_queue_counts.keys()) + [c.model_id for c in active_containers.values()])
+            for model_id in model_ids
         }
     }
 
@@ -1137,7 +1183,8 @@ async def proxy_request(request: Request):
                         footprint = known_footprints.get(target_model_id)
 
                         if TOTAL_GPU_VRAM > 0:
-                            # POOL-BASED PLACEMENT (whole-card model; no TP, no co-location).
+                            # POOL-BASED PLACEMENT (whole-card by default; tensor-parallel and
+                            # co-location handled below).
                             # known_footprints: None = never seen (discovery), 0 = seen-but-unmeasurable
                             # sentinel, >0 = measured. is_discovery only when truly unseen.
                             is_discovery = footprint is None
@@ -1286,7 +1333,7 @@ async def proxy_request(request: Request):
                                     logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); "
                                                     f"keeping whole-card estimate {int(needed_per_gpu)} MiB.")
                                     known_footprints[target_model_id] = 0  # sentinel: seen but unmeasurable
-                                save_known_footprints()
+                                await save_known_footprints_async()
 
                         else: # Fallback if VRAM management is disabled
                             # Without VRAM management, only run one container at a time
