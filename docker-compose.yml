@@ -23,9 +23,11 @@ services:
       # Path to the per-model config (mounted read-only at /app/config below).
       MODELS_CONFIG_FILE: ${MODELS_CONFIG_FILE:-/app/config/models.yaml}
 
-      # --- GPU PINNING ---
-      # Leave blank to use all GPUs (default). Set to a UUID from `nvidia-smi -L` to
-      # pin this gateway instance, and every vLLM container it launches, to one GPU.
+      # --- GPU PINNING / POOLS ---
+      # For multi-GPU, declare a 'pools:' section in models.yaml (one gateway manages
+      # several GPUs and places each model on a GPU in its pool). For a single GPU, leave
+      # GATEWAY_GPU_UUID blank to use all GPUs, or set it to a UUID from `nvidia-smi -L`
+      # to pin this gateway (and every container it launches) to one GPU. 'pools' wins if set.
       GATEWAY_GPU_UUID: ${GATEWAY_GPU_UUID:-}
 
       # --- NETWORKING ---

@@ -21,12 +21,13 @@ ALLOWED_CONFIG_KEYS = {
     "inactivity_timeout",
     "always_on",
     "extra_args",
+    "pool",  # name of the GPU pool this model is placed in (multi-GPU); None = default pool
 }
 
 # Per-model entries additionally require/allow "repo".
 ALLOWED_MODEL_KEYS = ALLOWED_CONFIG_KEYS | {"repo"}
 
-ALLOWED_TOP_LEVEL_KEYS = {"defaults", "models"}
+ALLOWED_TOP_LEVEL_KEYS = {"defaults", "models", "pools"}
 
 
 @dataclass
@@ -42,6 +43,7 @@ class ModelConfig:
     inactivity_timeout: int
     always_on: bool
     extra_args: list
+    pool: Optional[str]  # GPU pool name (multi-GPU placement); None = the default/implicit pool
 
 
 def _require_int(field: str, model: str, value):
@@ -89,6 +91,10 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
     if not isinstance(extra_args, list):
         raise ValueError(f"model '{name}': 'extra_args' must be a list, got {extra_args!r}")
 
+    pool = merged["pool"]
+    if pool is not None and (not isinstance(pool, str) or not pool.strip()):
+        raise ValueError(f"model '{name}': 'pool' must be a non-empty string or null, got {pool!r}")
+
     return ModelConfig(
         name=name,
         repo=repo,
@@ -101,6 +107,7 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
         always_on=always_on,
         # Fresh list of strings; never share the builtins/defaults list across models.
         extra_args=[str(a) for a in extra_args],
+        pool=pool.strip() if isinstance(pool, str) else None,
     )
 
 
@@ -169,3 +176,51 @@ def build_fallback_configs(allowed_models: dict, builtins: dict) -> "dict[str, M
     for name, repo in allowed_models.items():
         out[name] = _construct(name, repo, dict(builtins))
     return out
+
+
+def resolve_pools(raw: dict) -> "dict[str, list]":
+    """Parse and validate the optional top-level ``pools`` section.
+
+    Returns {pool_name: [gpu_uuid, ...]}, or {} when no ``pools`` key is present
+    (single-pool / backward-compatible mode). Raises ValueError (fail fast) on a
+    malformed declaration so the gateway never starts with an ambiguous GPU topology.
+    """
+    if not isinstance(raw, dict) or "pools" not in raw:
+        return {}
+
+    pools = raw["pools"]
+    if not isinstance(pools, dict) or not pools:
+        raise ValueError("'pools' must be a non-empty mapping of pool-name -> [gpu-uuid, ...]")
+
+    seen = {}  # uuid -> pool name, to catch a UUID assigned to two pools
+    resolved: "dict[str, list]" = {}
+    for pool_name, uuids in pools.items():
+        if not isinstance(uuids, list) or not uuids:
+            raise ValueError(f"pool '{pool_name}' must be a non-empty list of GPU UUIDs")
+        clean = []
+        for u in uuids:
+            if not isinstance(u, str) or not u.strip():
+                raise ValueError(f"pool '{pool_name}' contains an invalid GPU UUID: {u!r}")
+            u = u.strip()
+            if u in seen:
+                raise ValueError(f"GPU UUID {u!r} is in both pools '{seen[u]}' and '{pool_name}'")
+            seen[u] = pool_name
+            clean.append(u)
+        resolved[pool_name] = clean
+    return resolved
+
+
+def validate_model_pools(configs: "dict[str, ModelConfig]", pools: "dict[str, list]") -> None:
+    """Ensure each model's resolved pool names a declared pool. Raises ValueError on mismatch.
+
+    When ``pools`` is empty (no multi-GPU topology), a stray per-model ``pool`` is meaningless
+    and ignored by the caller; we don't raise so adding ``pool:`` can't break the fallback path.
+    """
+    if not pools:
+        return
+    declared = set(pools)
+    for name, cfg in configs.items():
+        if cfg.pool is not None and cfg.pool not in declared:
+            raise ValueError(
+                f"model '{name}': pool '{cfg.pool}' is not a declared pool; declared: {sorted(declared)}"
+            )

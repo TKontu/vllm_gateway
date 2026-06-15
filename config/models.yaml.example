@@ -8,7 +8,25 @@
 # Resolution precedence per setting:
 #   per-model entry  >  defaults block  >  built-in default (the old env var)
 
+# --- GPU pools (optional, multi-GPU) ---------------------------------------
+# Declare the GPUs this gateway manages and group them into named pools. Get the
+# full UUIDs from `nvidia-smi -L`. A model is placed on a GPU within its pool.
+#   - If 'pools' is omitted, the gateway runs single-pool: the GATEWAY_GPU_UUID
+#     pin if set, else all visible GPUs (unchanged legacy behavior).
+#   - Tensor-parallel and multi-model co-location are not yet supported: each model
+#     gets ~its whole GPU at its gpu_memory_utilization (whole-card placement).
+# NOTE: Embeddings/rerankers are expected to run OUT OF BAND — a separate always-on
+# TEI/infinity container pinned to the A2000 — NOT through this gateway. They are
+# therefore intentionally absent below. The gateway's 'util' pool reads the A2000's
+# real free VRAM (via nvidia-smi), so it accounts for that external embedder.
+pools:
+  llm:                                   # RTX 3090 — LLMs
+    - GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+  util:                                  # RTX A2000 — small/utility models (shares card with embedder)
+    - GPU-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+
 defaults:                      # optional; applied to every model unless overridden
+  pool: llm                    # default pool for models that don't set one
   gpu_memory_utilization: 0.90 # 0 < x <= 1
   max_model_len: 0             # 0 = use the model's native max (omit the flag)
   tensor_parallel_size: 1
@@ -19,14 +37,15 @@ defaults:                      # optional; applied to every model unless overrid
   extra_args: []               # raw vLLM CLI args, appended verbatim (override generated flags)
 
 models:                        # required, non-empty
-  # A small instruct model on its native context length.
+  # A small instruct model on its native context length (default pool: llm).
   gemma3-4B:
     repo: google/gemma-3-4b-it
 
-  # An AWQ-quantized model.
+  # An AWQ-quantized model on the LLM pool.
   qwen3-30b-awq:
     repo: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
     quantization: awq
+    pool: llm
 
   # A model pinned to a custom (capped) context length and a couple of extra flags.
   qwen2.5-coder:
@@ -35,8 +54,8 @@ models:                        # required, non-empty
     extra_args:
       - "--enable-prefix-caching"
 
-  # An always-on embedding model that is never unloaded by the inactivity monitor.
-  bge-m3:
-    repo: BAAI/bge-m3
-    always_on: true
-    inactivity_timeout: 0
+  # A small utility model placed on the A2000 'util' pool (e.g. a captioning/OCR helper).
+  small-util:
+    repo: Qwen/Qwen2.5-3B-Instruct
+    pool: util
+    gpu_memory_utilization: 0.45   # leave headroom for the external embedder on the A2000

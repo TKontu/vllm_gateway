@@ -154,6 +154,37 @@ must be a list). Any error is logged and the gateway refuses to start.
 legacy `ALLOWED_MODELS_JSON` env var with the global `VLLM_*` settings — behaving exactly as
 before this feature existed.
 
+## Multi-GPU pools
+
+One gateway can manage several GPUs by declaring a `pools:` section and assigning each model to a
+pool with `pool:`. Get the full UUIDs from `nvidia-smi -L`.
+
+```yaml
+pools:
+  llm:  [GPU-aaaa-…]   # RTX 3090 — LLMs
+  util: [GPU-bbbb-…]   # RTX A2000 — small/utility models
+defaults: { pool: llm, gpu_memory_utilization: 0.90 }
+models:
+  qwen3-30b-awq: { repo: …, quantization: awq, pool: llm }
+  small-util:    { repo: …, pool: util, gpu_memory_utilization: 0.45 }
+```
+
+- **Placement.** On each request the gateway picks a GPU *within the model's pool*: a card with
+  enough free VRAM (tie-break: most free); if none fits, it evicts idle models (LRU, never
+  `always_on` or in-flight) on a pool GPU; if it still can't fit, it returns **503** (it never
+  over-commits and risks an OOM). Per-GPU accounting uses *actual* free VRAM from `nvidia-smi`, so
+  it tolerates VRAM used by processes the gateway didn't start.
+- **Whole-card model.** This release does **not** tensor-parallel or co-locate multiple models on
+  one card — each model gets ~its whole GPU at its `gpu_memory_utilization`.
+- **GPU source precedence.** `pools:` in config → else `GATEWAY_GPU_UUID` (a single-GPU pool) →
+  else all visible GPUs (the legacy single-pool behavior). When no `pools:` are declared, behavior
+  is unchanged.
+- **Embeddings/rerankers** are expected to run **out of band** — a separate always-on
+  [TEI](https://github.com/huggingface/text-embeddings-inference) or
+  [infinity](https://github.com/michaelfeil/infinity) container pinned to the A2000 — **not**
+  through this swapping gateway. The gateway's `util` pool can still place small models on the same
+  A2000 because it reads the card's real free VRAM. See `/gateway/status` for per-GPU pool/usage/residents.
+
 ## Configuration
 
 All configuration is done via environment variables, making it easy to deploy with Portainer, Kubernetes, or directly from GitHub.

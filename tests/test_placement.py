@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
-from placement import select_evictions  # noqa: E402
+from placement import select_evictions, select_gpu, GpuView  # noqa: E402
 
 
 @dataclass
@@ -92,6 +92,57 @@ def test_best_effort_when_cannot_fit():
                            current_usage=22000, now=NOW, min_resident_seconds=90)
     # Best effort: evict what we can (the small one); caller logs/starts best-effort.
     assert out == ["small"], out
+
+
+# --- select_gpu (multi-GPU placement) ---
+
+def test_gpuview_free_floors_used_by_ready_footprint():
+    # A just-loaded model not yet in nvidia-smi: ready_footprint floors used_smi.
+    g = GpuView("A", total=24000, used_smi=500, reserved=0, ready_footprint=20000)
+    assert g.free == 24000 - 20000  # floored by ready_footprint, not the lagging 500
+    g2 = GpuView("B", total=24000, used_smi=21000, reserved=1000, ready_footprint=0)
+    assert g2.free == 24000 - 21000 - 1000
+
+
+def test_select_gpu_direct_fit_picks_most_free():
+    a = GpuView("A", total=24000, used_smi=10000)   # free 14000
+    b = GpuView("B", total=24000, used_smi=2000)     # free 22000
+    chosen, ev = select_gpu([a, b], {"A": [], "B": []}, needed=8000, now=NOW, min_resident_seconds=90)
+    assert chosen == "B" and ev == [], (chosen, ev)
+
+
+def test_select_gpu_external_process_excludes_gpu():
+    # A2000 (small, busy with an external embedder) can't fit; 3090 can.
+    a2000 = GpuView("A2000", total=6000, used_smi=4000)   # free 2000
+    rtx = GpuView("3090", total=24000, used_smi=0)        # free 24000
+    chosen, ev = select_gpu([a2000, rtx], {"A2000": [], "3090": []}, needed=8000, now=NOW, min_resident_seconds=90)
+    assert chosen == "3090" and ev == []
+
+
+def test_select_gpu_evicts_when_needed():
+    # GPU full with one old idle resident; eviction frees enough.
+    g = GpuView("A", total=24000, used_smi=20000, ready_footprint=20000)
+    resident = R("old", vram_footprint=20000, last_request_time=OLD, loaded_at=OLD)
+    chosen, ev = select_gpu([g], {"A": [resident]}, needed=18000, now=NOW, min_resident_seconds=90)
+    assert chosen == "A" and ev == ["old"], (chosen, ev)
+
+
+def test_select_gpu_no_fit_returns_none():
+    # Only resident is always_on and occupies the card -> cannot fit -> None (caller 503s).
+    g = GpuView("A", total=24000, used_smi=22000, ready_footprint=22000)
+    pinned = R("pinned", vram_footprint=22000, last_request_time=OLD, loaded_at=OLD, always_on=True)
+    chosen, ev = select_gpu([g], {"A": [pinned]}, needed=8000, now=NOW, min_resident_seconds=90)
+    assert chosen is None and ev == [], (chosen, ev)
+
+
+def test_select_gpu_prefers_fewer_evictions():
+    # Two GPUs can fit after eviction; pick the one needing fewer evictions.
+    g1 = GpuView("G1", total=24000, used_smi=24000, ready_footprint=24000)  # needs 2 evictions
+    g1r = [R("g1a", 12000, OLD, loaded_at=OLD), R("g1b", 12000, OLD - 1, loaded_at=OLD)]
+    g2 = GpuView("G2", total=24000, used_smi=24000, ready_footprint=24000)  # needs 1 eviction
+    g2r = [R("g2a", 24000, OLD, loaded_at=OLD)]
+    chosen, ev = select_gpu([g1, g2], {"G1": g1r, "G2": g2r}, needed=20000, now=NOW, min_resident_seconds=90)
+    assert chosen == "G2" and ev == ["g2a"], (chosen, ev)
 
 
 if __name__ == "__main__":
