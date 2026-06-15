@@ -11,7 +11,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
-from config_loader import resolve_model_configs, build_fallback_configs  # noqa: E402
+from config_loader import (  # noqa: E402
+    resolve_model_configs, build_fallback_configs, resolve_pools, validate_model_pools,
+)
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
 BUILTINS = {
@@ -23,6 +25,7 @@ BUILTINS = {
     "inactivity_timeout": 1800,
     "always_on": False,
     "extra_args": [],
+    "pool": None,
 }
 
 
@@ -136,6 +139,61 @@ def test_fallback_matches_builtins():
     assert c.inactivity_timeout == 1800
     assert c.always_on is False
     print("ok: fallback configs match builtins")
+
+
+# --- pools (multi-GPU) ---
+
+def test_resolve_pools_absent_and_valid():
+    assert resolve_pools({"models": {}}) == {}
+    pools = resolve_pools({"pools": {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}, "models": {}})
+    assert pools == {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}
+    print("ok: resolve_pools absent + valid")
+
+
+def test_resolve_pools_errors():
+    for raw, needle in [
+        ({"pools": {}}, "non-empty"),
+        ({"pools": {"llm": []}}, "non-empty list"),
+        ({"pools": {"llm": ["GPU-a", "  "]}}, "invalid GPU UUID"),
+        ({"pools": {"llm": ["GPU-a"], "util": ["GPU-a"]}}, "both pools"),
+    ]:
+        try:
+            resolve_pools(raw)
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+        else:
+            raise AssertionError(f"expected ValueError containing {needle!r}")
+    print("ok: resolve_pools errors")
+
+
+def test_pool_precedence_and_field():
+    raw = {
+        "defaults": {"pool": "llm"},
+        "models": {
+            "a": {"repo": "o/a"},                 # inherits defaults.pool
+            "b": {"repo": "o/b", "pool": "util"}, # per-model overrides
+        },
+    }
+    cfgs = resolve_model_configs(raw, BUILTINS)
+    assert cfgs["a"].pool == "llm"
+    assert cfgs["b"].pool == "util"
+    print("ok: pool precedence + field")
+
+
+def test_validate_model_pools():
+    pools = {"llm": ["GPU-a"], "util": ["GPU-b"]}
+    cfgs = resolve_model_configs({"models": {"a": {"repo": "o/a", "pool": "llm"}}}, BUILTINS)
+    validate_model_pools(cfgs, pools)  # ok
+    bad = resolve_model_configs({"models": {"a": {"repo": "o/a", "pool": "nope"}}}, BUILTINS)
+    try:
+        validate_model_pools(bad, pools)
+    except ValueError as e:
+        assert "not a declared pool" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for undeclared pool")
+    # pool set but no pools declared -> ignored (no raise)
+    validate_model_pools(bad, {})
+    print("ok: validate_model_pools")
 
 
 if __name__ == "__main__":

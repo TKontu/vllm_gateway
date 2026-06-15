@@ -12,11 +12,14 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from docker.types import DeviceRequest
 from docker.errors import NotFound, APIError
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from huggingface_hub import hf_hub_download, list_repo_files
 import yaml
 import placement
-from config_loader import ModelConfig, resolve_model_configs, build_fallback_configs
+from config_loader import (
+    ModelConfig, resolve_model_configs, build_fallback_configs,
+    resolve_pools, validate_model_pools,
+)
 
 # --- Logging Configuration ---
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -120,6 +123,14 @@ model_management_lock = asyncio.Lock()  # For updating active_containers dict
 container_start_locks = {}  # model_id -> asyncio.Lock for preventing concurrent container starts
 download_locks = {}  # model_id -> asyncio.Lock for preventing concurrent downloads
 
+# Multi-GPU placement state (resolved at startup; see resolve_managed_pools)
+MANAGED_POOLS = {}  # pool_name -> [gpu_uuid, ...]: the GPUs this gateway manages, grouped into pools
+MANAGED_GPUS = []   # flat list of managed gpu_uuids (union of MANAGED_POOLS values)
+gpu_reservations = {}  # gpu_uuid -> reserved MiB for models that are loading (not yet nvidia-smi visible)
+# Single global lock held ONLY for the placement decision (choose GPU + reserve), never across a
+# container start. Acquire order: container_start_locks[model] -> model_management_lock -> placement_lock.
+placement_lock = asyncio.Lock()
+
 # Queue management state
 model_semaphores = {}  # model_id -> asyncio.Semaphore for limiting concurrent requests
 model_queue_counts = {}  # model_id -> int (number of requests waiting in queue)
@@ -137,6 +148,7 @@ class ContainerState:
     always_on: bool = False  # if True, never auto-unloaded by the inactivity monitor
     inactivity_timeout: int = VLLM_INACTIVITY_TIMEOUT  # per-model idle timeout (seconds; 0 = never unload)
     loaded_at: float = 0.0  # time.time() when the container became ready (for anti-thrash cooldown)
+    gpu_uuids: list = field(default_factory=list)  # GPU UUID(s) this container is pinned to
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
@@ -190,6 +202,7 @@ async def lifespan(_app: FastAPI):
         logging.error(f"Gateway container '{GATEWAY_CONTAINER_NAME}' not found. Falling back to network '{DOCKER_NETWORK_NAME}'.")
 
     await get_total_vram()
+    resolve_managed_pools()
     load_known_footprints()
     asyncio.create_task(shutdown_inactive_containers())
 
@@ -212,14 +225,22 @@ async def run_in_executor(func, *args, **kwargs):
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
 async def run_nvidia_smi_in_container(command: list[str]) -> str:
-    """Runs an nvidia-smi command in a temporary container and returns the output."""
+    """Runs an nvidia-smi command in a temporary container and returns the output.
+
+    The probe must see every GPU this gateway manages so per-GPU accounting is complete.
+    Once pools are resolved it requests exactly the managed set; before that (startup) it
+    falls back to GPU_DEVICE_REQUESTS (the GATEWAY_GPU_UUID pin, or all GPUs)."""
+    if MANAGED_GPUS:
+        probe_requests = [DeviceRequest(device_ids=list(MANAGED_GPUS), capabilities=[['gpu']])]
+    else:
+        probe_requests = GPU_DEVICE_REQUESTS
     try:
         smi_output = await run_in_executor(
             docker_client.containers.run,
             NVIDIA_UTILITY_IMAGE,
             command=command,
             remove=True,
-            device_requests=GPU_DEVICE_REQUESTS
+            device_requests=probe_requests
         )
         return smi_output.decode('utf-8').strip()
     except APIError as e:
@@ -319,6 +340,37 @@ async def get_used_vram() -> float:
         logging.error("Could not determine used GPU VRAM.")
         return 0.0
     return float(_managed_vram(gpus, "used"))
+
+DEFAULT_POOL = "_default"  # implicit pool used in the single-pool / backward-compatible cases
+
+def resolve_managed_pools():
+    """Resolve which GPUs this gateway manages and how they're grouped into pools.
+
+    Precedence: (1) a 'pools:' section in the model config; (2) GATEWAY_GPU_UUID (one implicit
+    single-GPU pool); (3) all visible GPUs (one implicit pool — today's single-pool behavior).
+    Runs at startup after get_total_vram() has populated GPU_VRAM."""
+    global MANAGED_POOLS, MANAGED_GPUS
+    if CONFIGURED_POOLS:
+        MANAGED_POOLS = {name: list(uuids) for name, uuids in CONFIGURED_POOLS.items()}
+        source = f"config 'pools' ({len(MANAGED_POOLS)} pool(s))"
+    elif GATEWAY_GPU_UUID:
+        MANAGED_POOLS = {DEFAULT_POOL: [GATEWAY_GPU_UUID]}
+        source = f"GATEWAY_GPU_UUID pin ({GATEWAY_GPU_UUID})"
+    else:
+        MANAGED_POOLS = {DEFAULT_POOL: list(GPU_VRAM.keys())}
+        source = f"all visible GPUs ({len(GPU_VRAM)})"
+    MANAGED_GPUS = [u for uuids in MANAGED_POOLS.values() for u in uuids]
+    logging.info(f"Managed GPU pools resolved from {source}: "
+                 f"{ {p: u for p, u in MANAGED_POOLS.items()} }")
+    # Warn about configured UUIDs the probe can't see (typo / wrong host).
+    if GPU_VRAM:
+        unseen = [u for u in MANAGED_GPUS if u not in GPU_VRAM]
+        if unseen:
+            logging.warning(f"Configured GPU UUID(s) not visible to nvidia-smi: {unseen}")
+
+def pool_for(model_cfg) -> str:
+    """The pool a model belongs to: its configured pool, else the default/implicit pool."""
+    return model_cfg.pool if model_cfg.pool else DEFAULT_POOL
 
 def is_gguf_model(model_id: str) -> bool:
     """Check if the model_id refers to a GGUF file."""
@@ -486,13 +538,15 @@ def builtin_model_defaults() -> dict:
         "inactivity_timeout": VLLM_INACTIVITY_TIMEOUT,
         "always_on": False,
         "extra_args": [],
+        "pool": None,
     }
 
-def load_model_configs() -> "dict[str, ModelConfig]":
-    """Load per-model configuration.
+def load_model_configs() -> "tuple[dict, dict]":
+    """Load per-model configuration and any declared GPU pools.
 
     Uses MODELS_CONFIG_FILE (YAML) when it exists; otherwise falls back to the legacy
     ALLOWED_MODELS_JSON env var with built-in defaults (behaves exactly as before).
+    Returns (configs, pools); pools is {} unless a 'pools:' section is present.
     Raises on a malformed config file so the gateway fails fast at startup.
     """
     builtins = builtin_model_defaults()
@@ -504,8 +558,12 @@ def load_model_configs() -> "dict[str, ModelConfig]":
         if not raw:
             raise ValueError(f"Model config file '{MODELS_CONFIG_FILE}' is empty or not valid YAML")
         configs = resolve_model_configs(raw, builtins)
+        pools = resolve_pools(raw)
+        validate_model_pools(configs, pools)  # fail fast on a model referencing an undeclared pool
         logging.info(f"Loaded {len(configs)} model(s) from {MODELS_CONFIG_FILE}: {list(configs)}")
-        return configs
+        if pools:
+            logging.info(f"Declared GPU pools: { {p: len(u) for p, u in pools.items()} }")
+        return configs, pools
 
     if MODELS_CONFIG_FILE and os.path.isdir(MODELS_CONFIG_FILE):
         # A directory at the mount target usually means Docker created a missing file mount.
@@ -516,10 +574,10 @@ def load_model_configs() -> "dict[str, ModelConfig]":
     configs = build_fallback_configs(allowed, builtins)
     logging.info(f"No model config file at '{MODELS_CONFIG_FILE}'; using ALLOWED_MODELS_JSON fallback "
                  f"({len(configs)} model(s)): {list(configs)}")
-    return configs
+    return configs, {}
 
 # Resolve model configuration at import time so a bad config fails fast (refuses to start).
-MODEL_CONFIGS = load_model_configs()
+MODEL_CONFIGS, CONFIGURED_POOLS = load_model_configs()
 # name -> repo map, preserved for existing lookups throughout the app.
 ALLOWED_MODELS = {name: cfg.repo for name, cfg in MODEL_CONFIGS.items()}
 
@@ -648,8 +706,12 @@ def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
     merged.extend(extra)
     return merged
 
-async def start_model_container(model_id: str, container_name: str, model_cfg: ModelConfig) -> ContainerState | None:
-    """Starts a new vLLM container using the model's resolved configuration."""
+async def start_model_container(model_id: str, container_name: str, model_cfg: ModelConfig,
+                                gpu_uuids: "list[str] | None" = None) -> ContainerState | None:
+    """Starts a new vLLM container using the model's resolved configuration.
+
+    gpu_uuids pins the container to specific GPU(s) (multi-GPU placement). When None/empty,
+    falls back to GPU_DEVICE_REQUESTS (the gateway-wide pin or all GPUs) for backward compat."""
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
 
     # Clean up any existing container with the same name (from crashes or improper shutdowns)
@@ -783,7 +845,13 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
     try:
         vllm_image = get_vllm_image_for_model(model_id)
         logging.info(f"Using vLLM image: {vllm_image} for model {model_id}")
-        logging.info(f"Starting container {container_name} with command: {' '.join(command)}")
+        # Pin to the chosen GPU(s) when placement supplied them; else gateway-wide default.
+        if gpu_uuids:
+            device_requests = [DeviceRequest(device_ids=list(gpu_uuids), capabilities=[['gpu']])]
+        else:
+            device_requests = GPU_DEVICE_REQUESTS
+        logging.info(f"Starting container {container_name} on GPU(s) {gpu_uuids or 'default'} "
+                     f"with command: {' '.join(command)}")
         new_container = await run_in_executor(
             docker_client.containers.run,
             vllm_image,
@@ -798,7 +866,7 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
                 "VLLM_CACHE_BUST": str(uuid.uuid4()),
             },
             ipc_mode="host",
-            device_requests=GPU_DEVICE_REQUESTS,
+            device_requests=device_requests,
             volumes={
                 HOST_CACHE_DIR: {'bind': '/root/.cache/huggingface', 'mode': 'rw'},
                 VLLM_TEMP_DIR: {'bind': '/tmp', 'mode': 'rw'}  # For temporary GGUF downloads
@@ -859,6 +927,7 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
                         always_on=model_cfg.always_on,
                         inactivity_timeout=model_cfg.inactivity_timeout,
                         loaded_at=time.time(),
+                        gpu_uuids=list(gpu_uuids) if gpu_uuids else [],
                     )
                 elif response.status_code != 503:
                     # 503 is expected during vLLM initialization; anything else is worth noting
@@ -895,8 +964,23 @@ def list_models():
 @app.get("/gateway/status")
 def gateway_status():
     """Returns the current status of the gateway and its managed containers."""
+    # Per-GPU view: which pool each managed GPU is in, its residents, and reservation.
+    uuid_to_pool = {u: p for p, uuids in MANAGED_POOLS.items() for u in uuids}
+    gpus_status = {}
+    for guid in MANAGED_GPUS:
+        v = GPU_VRAM.get(guid, {})
+        residents = [c.container_name for c in active_containers.values() if guid in c.gpu_uuids]
+        gpus_status[guid] = {
+            "pool": uuid_to_pool.get(guid),
+            "total_mib": v.get("total"),
+            "used_mib": v.get("used"),
+            "reserved_mib": gpu_reservations.get(guid, 0.0),
+            "residents": residents,
+        }
     return {
         "total_gpu_vram_mib": TOTAL_GPU_VRAM,
+        "pools": MANAGED_POOLS,
+        "gpus": gpus_status,
         "known_footprints_mib": known_footprints,
         "active_containers": {name: state.__dict__ for name, state in active_containers.items()},
         "queue_status": {
@@ -1013,107 +1097,98 @@ async def proxy_request(request: Request):
                         # 2. Model not running, need to start it
                         footprint = known_footprints.get(target_model_id)
 
-                        if footprint is None and TOTAL_GPU_VRAM > 0:
-                            # DISCOVERY RUN
-                            logging.info(f"Unknown footprint for {target_model_id}. Starting a discovery run.")
+                        if TOTAL_GPU_VRAM > 0:
+                            # POOL-BASED PLACEMENT (whole-card model; no TP, no co-location).
+                            # known_footprints: None = never seen (discovery), 0 = seen-but-unmeasurable
+                            # sentinel, >0 = measured. is_discovery only when truly unseen.
+                            is_discovery = footprint is None
+                            pool = pool_for(model_cfg)
+                            pool_gpus = MANAGED_POOLS.get(pool, [])
+                            if not pool_gpus:
+                                raise HTTPException(status_code=500,
+                                                    detail=f"Pool '{pool}' for model {target_model_id} has no managed GPUs")
 
-                            # Stop active containers to isolate the measurement, but never an
-                            # always_on model. Leaving an always_on model resident is safe for the
-                            # footprint delta (it's present in both the before and after samples, so
-                            # it cancels out); it only reduces headroom for the discovery load.
+                            # Snapshot per-GPU VRAM OUTSIDE the placement lock (it spawns a container).
+                            gpus_snapshot = await get_gpu_vram()
+
+                            # --- DECIDE: choose a GPU + reserve, under the global placement lock ---
                             async with model_management_lock:
-                                container_names_to_stop = [
-                                    name for name, c in active_containers.items() if not c.always_on
-                                ]
-                                if container_names_to_stop:
-                                    logging.info(f"Stopping {len(container_names_to_stop)} container(s) for discovery run (always_on kept).")
+                                async with placement_lock:
+                                    candidates = []
+                                    residents_by_gpu = {}
+                                    for guid in pool_gpus:
+                                        g = gpus_snapshot.get(guid)
+                                        residents = [c for c in active_containers.values() if guid in c.gpu_uuids]
+                                        residents_by_gpu[guid] = residents
+                                        candidates.append(placement.GpuView(
+                                            uuid=guid,
+                                            total=float(g["total"]) if g else 0.0,
+                                            used_smi=float(g["used"]) if g else 0.0,
+                                            reserved=gpu_reservations.get(guid, 0.0),
+                                            ready_footprint=sum(c.vram_footprint for c in residents),
+                                        ))
+                                    # Whole-card estimate when the footprint isn't a measured number.
+                                    if footprint and footprint > 0:
+                                        needed_est = float(footprint)
+                                    else:
+                                        max_total = max((c.total for c in candidates), default=0.0)
+                                        needed_est = model_cfg.gpu_memory_utilization * max_total
 
-                            # Stop containers outside lock (I/O operation)
-                            for name in container_names_to_stop:
+                                    chosen_uuid, evictions = placement.select_gpu(
+                                        candidates, residents_by_gpu, needed_est,
+                                        time.time(), GATEWAY_MIN_RESIDENT_SECONDS,
+                                    )
+                                    if chosen_uuid is None:
+                                        raise HTTPException(
+                                            status_code=503,
+                                            detail=(f"No GPU in pool '{pool}' can fit model {target_model_id} "
+                                                    f"(~{int(needed_est)} MiB) without evicting always_on/in-flight models. Retry later."))
+
+                                    gpu_reservations[chosen_uuid] = gpu_reservations.get(chosen_uuid, 0.0) + needed_est
+                                    slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
+                                    free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
+                                    container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
+                                    logging.info(f"Placing {target_model_id} on GPU {chosen_uuid} (pool '{pool}', "
+                                                 f"~{int(needed_est)} MiB); evicting {evictions or 'nothing'}; slot {container_name}.")
+
+                            # --- Evictions + start happen OUTSIDE the locks (I/O) ---
+                            for name in evictions:
                                 await stop_container(name)
 
-                            vram_before = await get_used_vram()
-                            logging.info(f"VRAM usage before model load: {vram_before} MiB")
+                            before_used = gpus_snapshot.get(chosen_uuid, {}).get("used", 0.0) if is_discovery else 0.0
 
-                            container_name = f"{VLLM_CONTAINER_PREFIX}_0"
-                            # Start container outside lock (long I/O operation)
-                            target_container = await start_model_container(target_model_id, container_name, model_cfg)
+                            try:
+                                target_container = await start_model_container(
+                                    target_model_id, container_name, model_cfg, gpu_uuids=[chosen_uuid])
+                                if target_container:
+                                    # Seed footprint with the estimate so concurrent placement counts this
+                                    # GPU as occupied immediately; discovery refines it just below.
+                                    target_container.vram_footprint = needed_est
+                                    async with model_management_lock:
+                                        active_containers[container_name] = target_container
+                            finally:
+                                # Always release the optimistic reservation (model is now resident-and-counted
+                                # on success, or never loaded on failure). Single source-of-truth invariant.
+                                async with placement_lock:
+                                    gpu_reservations[chosen_uuid] = max(0.0, gpu_reservations.get(chosen_uuid, 0.0) - needed_est)
 
-                            if target_container:
-                                # Wait for model to fully load into VRAM and take multiple measurements
-                                logging.info("Waiting for model to fully load into VRAM (taking 3 measurements over 45 seconds)...")
-                                await asyncio.sleep(15)
-                                vram_samples = [await get_used_vram()]
-
-                                await asyncio.sleep(15)
-                                vram_samples.append(await get_used_vram())
-
-                                await asyncio.sleep(15)
-                                vram_samples.append(await get_used_vram())
-
-                                # Use maximum VRAM measurement to ensure we capture full footprint
-                                vram_after = max(vram_samples)
-                                logging.info(f"VRAM samples: {vram_samples} MiB, using max: {vram_after} MiB")
-
-                                measured_vram = vram_after - vram_before
-
-                                if measured_vram > 256: # Sanity check for a reasonable footprint
-                                    logging.info(f"Measured VRAM footprint for {target_model_id}: {measured_vram} MiB")
-                                    target_container.vram_footprint = measured_vram
-                                    known_footprints[target_model_id] = measured_vram
-                                    save_known_footprints()
+                            # Discovery: measure the real footprint on the CHOSEN GPU only.
+                            if target_container and is_discovery:
+                                logging.info("Discovery: sampling chosen-GPU VRAM 3x over 45s...")
+                                samples = []
+                                for _ in range(3):
+                                    await asyncio.sleep(15)
+                                    samples.append((await get_gpu_vram()).get(chosen_uuid, {}).get("used", 0.0))
+                                measured = max(samples) - before_used
+                                if measured > 256:
+                                    logging.info(f"Measured VRAM footprint for {target_model_id} on {chosen_uuid}: {measured} MiB")
+                                    target_container.vram_footprint = measured
+                                    known_footprints[target_model_id] = measured
                                 else:
-                                    logging.warning(f"Could not measure accurate footprint for {target_model_id} (calculated {measured_vram} MiB). Using container without VRAM management.")
-                                    target_container.vram_footprint = 0  # Mark as unknown
-                                    known_footprints[target_model_id] = 0  # sentinel: seen but unmeasurable — prevents repeat discovery runs
-                                    save_known_footprints()
-
-                                # Update active_containers with lock
-                                async with model_management_lock:
-                                    active_containers[container_name] = target_container
-
-
-                        elif TOTAL_GPU_VRAM > 0:
-                            # KNOWN FOOTPRINT RUN
-                            # Calculate VRAM and determine evictions with lock
-                            async with model_management_lock:
-                                current_vram_usage = sum(c.vram_footprint for c in active_containers.values())
-
-                                # Guarded LRU eviction: never evict always_on or in-flight models,
-                                # prefer models past the anti-thrash cooldown (see placement.select_evictions).
-                                containers_to_evict = placement.select_evictions(
-                                    residents=list(active_containers.values()),
-                                    needed=footprint,
-                                    total_vram=TOTAL_GPU_VRAM,
-                                    current_usage=current_vram_usage,
-                                    now=time.time(),
-                                    min_resident_seconds=GATEWAY_MIN_RESIDENT_SECONDS,
-                                )
-                                if containers_to_evict:
-                                    freed = sum(active_containers[n].vram_footprint for n in containers_to_evict)
-                                    logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). "
-                                                 f"Evicting {len(containers_to_evict)} idle container(s) to free ~{freed} MiB: {containers_to_evict}")
-                                    if current_vram_usage - freed + footprint > TOTAL_GPU_VRAM:
-                                        logging.warning(f"Could not free enough VRAM for {target_model_id} without evicting "
-                                                        f"always_on/in-flight models; starting best-effort (may contend for VRAM).")
-
-                                # Find a free slot index
-                                slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
-                                free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
-                                container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
-
-                            # Evict containers outside lock (I/O operation)
-                            for name in containers_to_evict:
-                                await stop_container(name)
-
-                            # Start container outside lock (long I/O operation)
-                            target_container = await start_model_container(target_model_id, container_name, model_cfg)
-                            if target_container:
-                                target_container.vram_footprint = footprint
-                                # Update active_containers with lock
-                                async with model_management_lock:
-                                    active_containers[container_name] = target_container
-
+                                    logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); "
+                                                    f"keeping whole-card estimate {int(needed_est)} MiB.")
+                                    known_footprints[target_model_id] = 0  # sentinel: seen but unmeasurable
+                                save_known_footprints()
 
                         else: # Fallback if VRAM management is disabled
                             # Without VRAM management, only run one container at a time
