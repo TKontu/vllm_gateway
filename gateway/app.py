@@ -15,6 +15,7 @@ from docker.errors import NotFound, APIError
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download, list_repo_files
 import yaml
+import placement
 from config_loader import ModelConfig, resolve_model_configs, build_fallback_configs
 
 # --- Logging Configuration ---
@@ -56,6 +57,11 @@ else:
 # Queue management configuration
 GATEWAY_MAX_QUEUE_SIZE = int(os.getenv("GATEWAY_MAX_QUEUE_SIZE", "200"))  # Max requests in queue per model
 GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max concurrent requests to vLLM per model
+
+# Anti-thrash: minimum seconds a freshly-loaded model is preferentially kept resident before it
+# becomes a candidate for eviction-to-make-room. Eviction falls back to fresh models only if no
+# older candidate frees enough VRAM (so a single-GPU swap is never blocked). 0 disables the cooldown.
+GATEWAY_MIN_RESIDENT_SECONDS = int(os.getenv("GATEWAY_MIN_RESIDENT_SECONDS", "90"))
 
 # Timeout configuration (in seconds)
 GATEWAY_REQUEST_TIMEOUT = int(os.getenv("GATEWAY_REQUEST_TIMEOUT", "300"))  # Total request timeout (default 5 minutes)
@@ -107,6 +113,7 @@ def is_gpt_oss_model(model_id: str) -> bool:
 # --- Global State ---
 RESOLVED_DOCKER_NETWORK = None
 TOTAL_GPU_VRAM = 0  # in MiB
+GPU_VRAM = {}  # uuid -> {"total": int MiB, "used": float MiB}; per-GPU foundation for multi-GPU placement
 known_footprints = {}
 active_containers = {}
 model_management_lock = asyncio.Lock()  # For updating active_containers dict
@@ -129,6 +136,7 @@ class ContainerState:
     active_requests: int = 0  # number of requests currently being proxied to this container
     always_on: bool = False  # if True, never auto-unloaded by the inactivity monitor
     inactivity_timeout: int = VLLM_INACTIVITY_TIMEOUT  # per-model idle timeout (seconds; 0 = never unload)
+    loaded_at: float = 0.0  # time.time() when the container became ready (for anti-thrash cooldown)
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
@@ -218,14 +226,49 @@ async def run_nvidia_smi_in_container(command: list[str]) -> str:
         logging.error(f"Error running nvidia-smi container: {e}")
         return ""
 
+def _parse_float(s: str) -> float:
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return 0.0
+
+async def get_gpu_vram() -> dict:
+    """Returns {uuid: {"total": int MiB, "used": float MiB}} for every visible GPU.
+
+    When the gateway is pinned (GATEWAY_GPU_UUID set), the probe container only sees that
+    one GPU, so the map has a single entry. Unpinned, it lists all visible GPUs — parsing
+    every CSV line instead of just the first (which read GPU 0 only)."""
+    output = await run_nvidia_smi_in_container(
+        ["nvidia-smi", "--query-gpu=uuid,memory.total,memory.used", "--format=csv,noheader,nounits"]
+    )
+    gpus = {}
+    for line in output.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            continue
+        uuid, total, used = parts
+        if uuid and total.isdigit():
+            gpus[uuid] = {"total": int(total), "used": _parse_float(used)}
+    return gpus
+
+def _managed_vram(gpus: dict, key: str) -> float:
+    """Sum a VRAM field across the GPUs this instance manages.
+
+    Pinned -> just that GPU; unpinned -> all visible GPUs (single-pool semantics, unchanged)."""
+    if GATEWAY_GPU_UUID and GATEWAY_GPU_UUID in gpus:
+        return gpus[GATEWAY_GPU_UUID][key]
+    return sum(g[key] for g in gpus.values())
+
 async def get_total_vram():
-    """Gets total GPU VRAM in MiB."""
-    global TOTAL_GPU_VRAM
+    """Measures per-GPU VRAM, stores the per-UUID map, and sets the managed total (MiB)."""
+    global TOTAL_GPU_VRAM, GPU_VRAM
     logging.info("Getting total GPU VRAM...")
-    output = await run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"])
-    if output and output.isdigit():
-        TOTAL_GPU_VRAM = int(output)
-        logging.info(f"Total GPU VRAM: {TOTAL_GPU_VRAM} MiB")
+    GPU_VRAM = await get_gpu_vram()
+    if GPU_VRAM:
+        for uuid, v in GPU_VRAM.items():
+            logging.info(f"GPU {uuid}: {v['total']} MiB total")
+        TOTAL_GPU_VRAM = int(_managed_vram(GPU_VRAM, "total"))
+        logging.info(f"Managed total GPU VRAM: {TOTAL_GPU_VRAM} MiB across {len(GPU_VRAM)} GPU(s)")
     else:
         logging.error("Could not determine total GPU VRAM. Disabling dynamic memory management.")
         TOTAL_GPU_VRAM = 0
@@ -270,13 +313,12 @@ def save_known_footprints():
         logging.error(f"Could not save memory footprints file: {e}")
 
 async def get_used_vram() -> float:
-    """Gets currently used GPU VRAM in MiB."""
-    output = await run_nvidia_smi_in_container(["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"])
-    if output and output.isdigit():
-        return float(output)
-    else:
+    """Gets currently used GPU VRAM (MiB) across the managed GPU(s)."""
+    gpus = await get_gpu_vram()
+    if not gpus:
         logging.error("Could not determine used GPU VRAM.")
         return 0.0
+    return float(_managed_vram(gpus, "used"))
 
 def is_gguf_model(model_id: str) -> bool:
     """Check if the model_id refers to a GGUF file."""
@@ -816,6 +858,7 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
                         vram_footprint=0, # Footprint is unknown until measured
                         always_on=model_cfg.always_on,
                         inactivity_timeout=model_cfg.inactivity_timeout,
+                        loaded_at=time.time(),
                     )
                 elif response.status_code != 503:
                     # 503 is expected during vLLM initialization; anything else is worth noting
@@ -974,13 +1017,16 @@ async def proxy_request(request: Request):
                             # DISCOVERY RUN
                             logging.info(f"Unknown footprint for {target_model_id}. Starting a discovery run.")
 
-                            # Check and stop containers with lock
+                            # Stop active containers to isolate the measurement, but never an
+                            # always_on model. Leaving an always_on model resident is safe for the
+                            # footprint delta (it's present in both the before and after samples, so
+                            # it cancels out); it only reduces headroom for the discovery load.
                             async with model_management_lock:
-                                if active_containers:
-                                    logging.info("Stopping all active containers for discovery run.")
-                                    container_names_to_stop = list(active_containers.keys())
-                                else:
-                                    container_names_to_stop = []
+                                container_names_to_stop = [
+                                    name for name, c in active_containers.items() if not c.always_on
+                                ]
+                                if container_names_to_stop:
+                                    logging.info(f"Stopping {len(container_names_to_stop)} container(s) for discovery run (always_on kept).")
 
                             # Stop containers outside lock (I/O operation)
                             for name in container_names_to_stop:
@@ -1032,17 +1078,24 @@ async def proxy_request(request: Request):
                             # Calculate VRAM and determine evictions with lock
                             async with model_management_lock:
                                 current_vram_usage = sum(c.vram_footprint for c in active_containers.values())
-                                containers_to_evict = []
 
-                                if current_vram_usage + footprint > TOTAL_GPU_VRAM:
-                                    logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). Evicting LRU containers.")
-                                    # Determine which containers to evict
-                                    sorted_containers = sorted(active_containers.values(), key=lambda c: c.last_request_time)
-                                    for container_to_evict in sorted_containers:
-                                        containers_to_evict.append(container_to_evict.container_name)
-                                        current_vram_usage -= container_to_evict.vram_footprint
-                                        if current_vram_usage + footprint <= TOTAL_GPU_VRAM:
-                                            break
+                                # Guarded LRU eviction: never evict always_on or in-flight models,
+                                # prefer models past the anti-thrash cooldown (see placement.select_evictions).
+                                containers_to_evict = placement.select_evictions(
+                                    residents=list(active_containers.values()),
+                                    needed=footprint,
+                                    total_vram=TOTAL_GPU_VRAM,
+                                    current_usage=current_vram_usage,
+                                    now=time.time(),
+                                    min_resident_seconds=GATEWAY_MIN_RESIDENT_SECONDS,
+                                )
+                                if containers_to_evict:
+                                    freed = sum(active_containers[n].vram_footprint for n in containers_to_evict)
+                                    logging.info(f"Not enough VRAM for {target_model_id} (needs {footprint} MiB). "
+                                                 f"Evicting {len(containers_to_evict)} idle container(s) to free ~{freed} MiB: {containers_to_evict}")
+                                    if current_vram_usage - freed + footprint > TOTAL_GPU_VRAM:
+                                        logging.warning(f"Could not free enough VRAM for {target_model_id} without evicting "
+                                                        f"always_on/in-flight models; starting best-effort (may contend for VRAM).")
 
                                 # Find a free slot index
                                 slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
