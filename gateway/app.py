@@ -18,7 +18,7 @@ import yaml
 import placement
 from config_loader import (
     ModelConfig, resolve_model_configs, build_fallback_configs,
-    resolve_pools, validate_model_pools,
+    resolve_pools, validate_model_pools, validate_tp_against_pools,
 )
 
 # --- Logging Configuration ---
@@ -560,6 +560,7 @@ def load_model_configs() -> "tuple[dict, dict]":
         configs = resolve_model_configs(raw, builtins)
         pools = resolve_pools(raw)
         validate_model_pools(configs, pools)  # fail fast on a model referencing an undeclared pool
+        validate_tp_against_pools(configs, pools)  # fail fast if tensor_parallel_size > pool GPU count
         logging.info(f"Loaded {len(configs)} model(s) from {MODELS_CONFIG_FILE}: {list(configs)}")
         if pools:
             logging.info(f"Declared GPU pools: { {p: len(u) for p, u in pools.items()} }")
@@ -678,6 +679,26 @@ async def get_model_max_len(model_id: str) -> int:
         logging.error(f"An error occurred while getting max length for {model_id}: {e}")
         return 0
 
+async def estimate_weight_bytes(model_id: str) -> "int | None":
+    """Best-effort estimate of a model's on-disk weight size in bytes, for the TP-fallback
+    decision (how many GPUs a model's weights need). Returns None when it can't be determined.
+
+    Reads the safetensors shard index (one small JSON GET, same pattern as get_model_max_len);
+    that metadata already reflects quantized sizes. GGUF / non-safetensors repos return None,
+    in which case the caller degrades to the configured tensor_parallel_size."""
+    if is_gguf_model(model_id) or '/' not in model_id or model_id.startswith(('http://', 'https://')):
+        return None
+    index_url = f"https://huggingface.co/{model_id}/raw/main/model.safetensors.index.json"
+    try:
+        resp = await http_client.get(index_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
+        if resp.status_code == 200:
+            total = resp.json().get("metadata", {}).get("total_size")
+            if isinstance(total, int) and total > 0:
+                return total
+    except Exception as e:
+        logging.warning(f"Could not estimate weight size for {model_id}: {e}")
+    return None
+
 def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
     """Append raw extra_args verbatim, letting them override any flag the base set.
 
@@ -707,11 +728,15 @@ def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
     return merged
 
 async def start_model_container(model_id: str, container_name: str, model_cfg: ModelConfig,
-                                gpu_uuids: "list[str] | None" = None) -> ContainerState | None:
+                                gpu_uuids: "list[str] | None" = None,
+                                effective_tp: "int | None" = None) -> ContainerState | None:
     """Starts a new vLLM container using the model's resolved configuration.
 
     gpu_uuids pins the container to specific GPU(s) (multi-GPU placement). When None/empty,
-    falls back to GPU_DEVICE_REQUESTS (the gateway-wide pin or all GPUs) for backward compat."""
+    falls back to GPU_DEVICE_REQUESTS (the gateway-wide pin or all GPUs) for backward compat.
+    effective_tp overrides --tensor-parallel-size (for TP fallback); defaults to the model's
+    configured tensor_parallel_size. model_cfg is never mutated (it is shared across requests)."""
+    tp = effective_tp if effective_tp else model_cfg.tensor_parallel_size
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
 
     # Clean up any existing container with the same name (from crashes or improper shutdowns)
@@ -791,8 +816,8 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
     # Always present: --model, --gpu-memory-utilization, --tensor-parallel-size.
     command = ["--model", actual_model_path,
                "--gpu-memory-utilization", str(model_cfg.gpu_memory_utilization)]
-    if model_cfg.tensor_parallel_size > 0:
-        command.extend(["--tensor-parallel-size", str(model_cfg.tensor_parallel_size)])
+    if tp > 0:
+        command.extend(["--tensor-parallel-size", str(tp)])
 
     # Add GGUF-specific parameters if this is a GGUF model
     if is_gguf_model(actual_model_path) or tokenizer_repo:
@@ -1111,7 +1136,27 @@ async def proxy_request(request: Request):
                             # Snapshot per-GPU VRAM OUTSIDE the placement lock (it spawns a container).
                             gpus_snapshot = await get_gpu_vram()
 
-                            # --- DECIDE: choose a GPU + reserve, under the global placement lock ---
+                            # Per-card need (whole-card model: independent of TP degree).
+                            if footprint and footprint > 0:
+                                needed_per_gpu = float(footprint)
+                            else:
+                                pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
+                                needed_per_gpu = model_cfg.gpu_memory_utilization * (max(pool_totals) if pool_totals else 0.0)
+
+                            # Effective TP: forced by config, or auto-fallback for an unseen model whose
+                            # weights exceed one card (only in a homogeneous, multi-GPU pool).
+                            effective_tp = model_cfg.tensor_parallel_size
+                            if (is_discovery and model_cfg.tensor_parallel_size == 1 and len(pool_gpus) >= 2):
+                                pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
+                                if pool_totals and (max(pool_totals) - min(pool_totals)) <= 0.05 * max(pool_totals):
+                                    wbytes = await estimate_weight_bytes(target_model_id)
+                                    min_tp = placement.minimal_tp_to_fit(
+                                        wbytes, max(pool_totals), model_cfg.gpu_memory_utilization, pool_size=len(pool_gpus))
+                                    if min_tp > effective_tp:
+                                        logging.info(f"TP fallback for {target_model_id}: weights ~{wbytes} B -> tp={min_tp}")
+                                        effective_tp = min_tp
+
+                            # --- DECIDE: choose GPU(s) + reserve, under the global placement lock ---
                             async with model_management_lock:
                                 async with placement_lock:
                                     candidates = []
@@ -1127,66 +1172,65 @@ async def proxy_request(request: Request):
                                             reserved=gpu_reservations.get(guid, 0.0),
                                             ready_footprint=sum(c.vram_footprint for c in residents),
                                         ))
-                                    # Whole-card estimate when the footprint isn't a measured number.
-                                    if footprint and footprint > 0:
-                                        needed_est = float(footprint)
-                                    else:
-                                        max_total = max((c.total for c in candidates), default=0.0)
-                                        needed_est = model_cfg.gpu_memory_utilization * max_total
 
-                                    chosen_uuid, evictions = placement.select_gpu(
-                                        candidates, residents_by_gpu, needed_est,
+                                    chosen_uuids, evictions = placement.select_placement(
+                                        candidates, residents_by_gpu, needed_per_gpu, effective_tp,
                                         time.time(), GATEWAY_MIN_RESIDENT_SECONDS,
                                     )
-                                    if chosen_uuid is None:
+                                    if chosen_uuids is None:
                                         raise HTTPException(
                                             status_code=503,
-                                            detail=(f"No GPU in pool '{pool}' can fit model {target_model_id} "
-                                                    f"(~{int(needed_est)} MiB) without evicting always_on/in-flight models. Retry later."))
+                                            detail=(f"Cannot place model {target_model_id} in pool '{pool}' at tp={effective_tp} "
+                                                    f"(~{int(needed_per_gpu)} MiB/GPU): pool not homogeneous, has too few GPUs, "
+                                                    f"or no {effective_tp} GPU(s) free without evicting always_on/in-flight models. Retry later."))
 
-                                    gpu_reservations[chosen_uuid] = gpu_reservations.get(chosen_uuid, 0.0) + needed_est
+                                    for u in chosen_uuids:
+                                        gpu_reservations[u] = gpu_reservations.get(u, 0.0) + needed_per_gpu
                                     slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
                                     free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
                                     container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
-                                    logging.info(f"Placing {target_model_id} on GPU {chosen_uuid} (pool '{pool}', "
-                                                 f"~{int(needed_est)} MiB); evicting {evictions or 'nothing'}; slot {container_name}.")
+                                    logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', tp={effective_tp}, "
+                                                 f"~{int(needed_per_gpu)} MiB/GPU); evicting {evictions or 'nothing'}; slot {container_name}.")
 
                             # --- Evictions + start happen OUTSIDE the locks (I/O) ---
                             for name in evictions:
                                 await stop_container(name)
 
-                            before_used = gpus_snapshot.get(chosen_uuid, {}).get("used", 0.0) if is_discovery else 0.0
+                            before_used = gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0) if is_discovery else 0.0
 
                             try:
                                 target_container = await start_model_container(
-                                    target_model_id, container_name, model_cfg, gpu_uuids=[chosen_uuid])
+                                    target_model_id, container_name, model_cfg,
+                                    gpu_uuids=chosen_uuids, effective_tp=effective_tp)
                                 if target_container:
-                                    # Seed footprint with the estimate so concurrent placement counts this
-                                    # GPU as occupied immediately; discovery refines it just below.
-                                    target_container.vram_footprint = needed_est
+                                    # Seed footprint with the estimate so concurrent placement counts these
+                                    # GPU(s) as occupied immediately; discovery refines it just below.
+                                    target_container.vram_footprint = needed_per_gpu
                                     async with model_management_lock:
                                         active_containers[container_name] = target_container
                             finally:
-                                # Always release the optimistic reservation (model is now resident-and-counted
-                                # on success, or never loaded on failure). Single source-of-truth invariant.
+                                # Always release the optimistic reservation on ALL chosen GPUs (model is now
+                                # resident-and-counted on success, or never loaded on failure).
                                 async with placement_lock:
-                                    gpu_reservations[chosen_uuid] = max(0.0, gpu_reservations.get(chosen_uuid, 0.0) - needed_est)
+                                    for u in chosen_uuids:
+                                        gpu_reservations[u] = max(0.0, gpu_reservations.get(u, 0.0) - needed_per_gpu)
 
-                            # Discovery: measure the real footprint on the CHOSEN GPU only.
+                            # Discovery: measure the per-GPU footprint on one chosen GPU (homogeneous + symmetric under TP).
                             if target_container and is_discovery:
-                                logging.info("Discovery: sampling chosen-GPU VRAM 3x over 45s...")
+                                meas_gpu = chosen_uuids[0]
+                                logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
                                 samples = []
                                 for _ in range(3):
                                     await asyncio.sleep(15)
-                                    samples.append((await get_gpu_vram()).get(chosen_uuid, {}).get("used", 0.0))
+                                    samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
                                 measured = max(samples) - before_used
                                 if measured > 256:
-                                    logging.info(f"Measured VRAM footprint for {target_model_id} on {chosen_uuid}: {measured} MiB")
+                                    logging.info(f"Measured per-GPU footprint for {target_model_id} on {meas_gpu}: {measured} MiB")
                                     target_container.vram_footprint = measured
                                     known_footprints[target_model_id] = measured
                                 else:
                                     logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); "
-                                                    f"keeping whole-card estimate {int(needed_est)} MiB.")
+                                                    f"keeping whole-card estimate {int(needed_per_gpu)} MiB.")
                                     known_footprints[target_model_id] = 0  # sentinel: seen but unmeasurable
                                 save_known_footprints()
 

@@ -10,7 +10,9 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
-from placement import select_evictions, select_gpu, GpuView  # noqa: E402
+from placement import (  # noqa: E402
+    select_evictions, select_gpu, GpuView, select_placement, minimal_tp_to_fit, _homogeneous,
+)
 
 
 @dataclass
@@ -143,6 +145,68 @@ def test_select_gpu_prefers_fewer_evictions():
     g2r = [R("g2a", 24000, OLD, loaded_at=OLD)]
     chosen, ev = select_gpu([g1, g2], {"G1": g1r, "G2": g2r}, needed=20000, now=NOW, min_resident_seconds=90)
     assert chosen == "G2" and ev == ["g2a"], (chosen, ev)
+
+
+# --- select_placement / TP (Phase 2) ---
+
+def test_homogeneous_helper():
+    assert _homogeneous([GpuView("A", 24000), GpuView("B", 24000)])
+    assert _homogeneous([GpuView("A", 24000), GpuView("B", 23500)])   # within 5%
+    assert not _homogeneous([GpuView("A", 24000), GpuView("B", 6000)])  # 3090 + A2000
+
+
+def test_minimal_tp_to_fit():
+    # weights fit one card -> 1
+    assert minimal_tp_to_fit(10 * 1024**3, 24000, 0.9) == 1
+    # ~30 GiB weights * 1.2 overhead = 36 GiB; usable/card = 0.9*24000 MiB ≈ 21.6 GiB -> 2
+    assert minimal_tp_to_fit(30 * 1024**3, 24000, 0.9) == 2
+    # huge weights capped at pool size
+    assert minimal_tp_to_fit(500 * 1024**3, 24000, 0.9, pool_size=2) == 2
+    # unknown size -> no split
+    assert minimal_tp_to_fit(None, 24000, 0.9) == 1
+    assert minimal_tp_to_fit(0, 24000, 0.9) == 1
+
+
+def test_select_placement_tp1_matches_select_gpu():
+    a = GpuView("A", 24000, used_smi=10000)
+    b = GpuView("B", 24000, used_smi=2000)
+    rbg = {"A": [], "B": []}
+    sp = select_placement([a, b], rbg, 8000, 1, NOW, 90)
+    sg = select_gpu([a, b], rbg, 8000, NOW, 90)
+    assert sp == ([sg[0]], sg[1]), (sp, sg)   # tp==1 wraps select_gpu identically
+
+
+def test_select_placement_forced_tp2_picks_two_most_free():
+    a = GpuView("A", 24000, used_smi=20000)  # free 4000
+    b = GpuView("B", 24000, used_smi=0)       # free 24000
+    c = GpuView("C", 24000, used_smi=1000)    # free 23000
+    chosen, ev = select_placement([a, b, c], {"A": [], "B": [], "C": []}, 8000, 2, NOW, 90)
+    assert sorted(chosen) == ["B", "C"] and ev == [], (chosen, ev)
+
+
+def test_select_placement_tp_rejects_heterogeneous():
+    a = GpuView("3090", 24000, used_smi=0)
+    b = GpuView("A2000", 6000, used_smi=0)
+    chosen, ev = select_placement([a, b], {"3090": [], "A2000": []}, 4000, 2, NOW, 90)
+    assert chosen is None, chosen
+
+
+def test_select_placement_tp_insufficient_gpus():
+    # forced tp=2 with only one GPU visible (2nd 3090 not installed) -> None, graceful
+    a = GpuView("A", 24000, used_smi=0)
+    chosen, ev = select_placement([a], {"A": []}, 8000, 2, NOW, 90)
+    assert chosen is None, chosen
+
+
+def test_select_placement_tp_evicts_and_dedupes():
+    # Both GPUs full; each has an idle resident; tp=2 must evict on both, deduped.
+    a = GpuView("A", 24000, used_smi=24000, ready_footprint=24000)
+    b = GpuView("B", 24000, used_smi=24000, ready_footprint=24000)
+    ra = [R("ra", 24000, OLD, loaded_at=OLD)]
+    rb = [R("rb", 24000, OLD, loaded_at=OLD)]
+    chosen, ev = select_placement([a, b], {"A": ra, "B": rb}, 20000, 2, NOW, 90)
+    assert sorted(chosen) == ["A", "B"]
+    assert sorted(ev) == ["ra", "rb"] and len(ev) == len(set(ev)), ev
 
 
 if __name__ == "__main__":

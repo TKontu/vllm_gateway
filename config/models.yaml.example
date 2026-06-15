@@ -13,15 +13,20 @@
 # full UUIDs from `nvidia-smi -L`. A model is placed on a GPU within its pool.
 #   - If 'pools' is omitted, the gateway runs single-pool: the GATEWAY_GPU_UUID
 #     pin if set, else all visible GPUs (unchanged legacy behavior).
-#   - Tensor-parallel and multi-model co-location are not yet supported: each model
-#     gets ~its whole GPU at its gpu_memory_utilization (whole-card placement).
+#   - Each model gets ~its whole GPU at its gpu_memory_utilization (whole-card
+#     placement); multi-model co-location is not yet supported.
+#   - Tensor-parallel (tensor_parallel_size > 1) spreads ONE model across several
+#     GPUs of its pool. TP requires a HOMOGENEOUS pool (equal-VRAM cards) — never
+#     mix a 3090 and an A2000. TP over PCIe (no NVLink) has real comms cost, so use
+#     it only for models that genuinely won't fit on one card.
 # NOTE: Embeddings/rerankers are expected to run OUT OF BAND — a separate always-on
 # TEI/infinity container pinned to the A2000 — NOT through this gateway. They are
 # therefore intentionally absent below. The gateway's 'util' pool reads the A2000's
 # real free VRAM (via nvidia-smi), so it accounts for that external embedder.
 pools:
-  llm:                                   # RTX 3090 — LLMs
+  llm:                                   # RTX 3090s (homogeneous) — LLMs; TP-capable
     - GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    - GPU-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
   util:                                  # RTX A2000 — small/utility models (shares card with embedder)
     - GPU-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
 
@@ -59,3 +64,13 @@ models:                        # required, non-empty
     repo: Qwen/Qwen2.5-3B-Instruct
     pool: util
     gpu_memory_utilization: 0.45   # leave headroom for the external embedder on the A2000
+
+  # A large model forced across both 3090s with tensor parallel. tensor_parallel_size must
+  # not exceed the GPUs declared in the pool (validated at startup), and the pool must be
+  # homogeneous (checked at placement). Models that fit on one card stay single-GPU; a model
+  # too big for one card auto-falls-back to the minimal TP that fits even without this flag.
+  big-llm-tp2:
+    repo: cyankiwi/Qwen3.5-27B-AWQ-4bit
+    quantization: awq
+    pool: llm
+    tensor_parallel_size: 2

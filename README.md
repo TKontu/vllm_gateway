@@ -174,8 +174,15 @@ models:
   `always_on` or in-flight) on a pool GPU; if it still can't fit, it returns **503** (it never
   over-commits and risks an OOM). Per-GPU accounting uses *actual* free VRAM from `nvidia-smi`, so
   it tolerates VRAM used by processes the gateway didn't start.
-- **Whole-card model.** This release does **not** tensor-parallel or co-locate multiple models on
-  one card — each model gets ~its whole GPU at its `gpu_memory_utilization`.
+- **Tensor parallel.** Set `tensor_parallel_size: k` to spread one model across `k` GPUs of its
+  pool (launched with `--tensor-parallel-size k`, pinned to those cards). TP requires a
+  **homogeneous** pool (equal-VRAM GPUs — never a 3090+A2000 mix; the util pool's single A2000
+  never TPs) and `k` must not exceed the GPUs declared in the pool (validated at startup). A model
+  with `tensor_parallel_size: 1` whose **weights exceed one card** auto-falls-back to the minimal TP
+  that fits. TP over PCIe (no NVLink) has real comms cost, so prefer single-GPU when a model fits.
+  Each card is still filled to `gpu_memory_utilization` (TP fits bigger *weights*, not more KV).
+- **No co-location.** This release does not co-locate multiple models on one card — each model gets
+  ~its whole GPU at its `gpu_memory_utilization`.
 - **GPU source precedence.** `pools:` in config → else `GATEWAY_GPU_UUID` (a single-GPU pool) →
   else all visible GPUs (the legacy single-pool behavior). When no `pools:` are declared, behavior
   is unchanged.

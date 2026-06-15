@@ -12,7 +12,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
 from config_loader import (  # noqa: E402
-    resolve_model_configs, build_fallback_configs, resolve_pools, validate_model_pools,
+    resolve_model_configs, build_fallback_configs, resolve_pools,
+    validate_model_pools, validate_tp_against_pools,
 )
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
@@ -194,6 +195,39 @@ def test_validate_model_pools():
     # pool set but no pools declared -> ignored (no raise)
     validate_model_pools(bad, {})
     print("ok: validate_model_pools")
+
+
+def test_poolless_model_rejected_when_pools_declared():
+    pools = {"llm": ["GPU-a"]}
+    cfgs = resolve_model_configs({"models": {"a": {"repo": "o/a"}}}, BUILTINS)  # no pool, no default
+    try:
+        validate_model_pools(cfgs, pools)
+    except ValueError as e:
+        assert "no pool set" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for pool-less model under declared pools")
+    # but with a defaults.pool it resolves and passes
+    ok = resolve_model_configs({"defaults": {"pool": "llm"}, "models": {"a": {"repo": "o/a"}}}, BUILTINS)
+    validate_model_pools(ok, pools)
+    print("ok: pool-less model rejected when pools declared")
+
+
+def test_validate_tp_against_pools():
+    pools = {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}
+    # tp=2 with 2-GPU pool -> ok
+    ok = resolve_model_configs({"models": {"m": {"repo": "o/m", "pool": "llm", "tensor_parallel_size": 2}}}, BUILTINS)
+    validate_tp_against_pools(ok, pools)
+    # tp=2 in a 1-GPU pool -> raises
+    bad = resolve_model_configs({"models": {"m": {"repo": "o/m", "pool": "util", "tensor_parallel_size": 2}}}, BUILTINS)
+    try:
+        validate_tp_against_pools(bad, pools)
+    except ValueError as e:
+        assert "exceeds" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for tp > pool size")
+    # no pools declared -> never raises on tp
+    validate_tp_against_pools(bad, {})
+    print("ok: validate_tp_against_pools")
 
 
 if __name__ == "__main__":
