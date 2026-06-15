@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
 from placement import (  # noqa: E402
     select_evictions, select_gpu, GpuView, select_placement, minimal_tp_to_fit, _homogeneous,
+    select_colocated,
 )
 
 
@@ -23,6 +24,7 @@ class R:  # minimal stand-in for ContainerState
     loaded_at: float = 0.0
     active_requests: int = 0
     always_on: bool = False
+    colocate: bool = False
 
 
 NOW = 1_000_000.0
@@ -207,6 +209,55 @@ def test_select_placement_tp_evicts_and_dedupes():
     chosen, ev = select_placement([a, b], {"A": ra, "B": rb}, 20000, 2, NOW, 90)
     assert sorted(chosen) == ["A", "B"]
     assert sorted(ev) == ["ra", "rb"] and len(ev) == len(set(ev)), ev
+
+
+# --- select_colocated (Phase 3) ---
+
+def test_colocated_empty_gpu_direct_fit():
+    g = GpuView("A", 24000, used_smi=0)
+    uuid, ev = select_colocated([g], {"A": []}, 10800, NOW, 90)
+    assert uuid == "A" and ev == []
+
+
+def test_colocated_shares_with_colocate_resident():
+    # A already holds a colocate model (10800); a second colocate model (10800) fits alongside.
+    a = GpuView("A", 24000, used_smi=10800, ready_footprint=10800)
+    res = [R("a1", 10800, OLD, loaded_at=OLD, colocate=True)]
+    uuid, ev = select_colocated([a], {"A": res}, 10800, NOW, 90)
+    assert uuid == "A" and ev == [], (uuid, ev)
+
+
+def test_colocated_rejects_wholecard_resident():
+    # A holds a non-colocate (whole-card) model -> not eligible for co-location.
+    a = GpuView("A", 24000, used_smi=12000, ready_footprint=12000)
+    res = [R("wc", 12000, OLD, loaded_at=OLD, colocate=False)]
+    uuid, ev = select_colocated([a], {"A": res}, 10800, NOW, 90)
+    assert uuid is None, (uuid, ev)
+
+
+def test_colocated_evicts_only_as_needed():
+    # Card full of two idle colocate models; need room for one more -> evict the single LRU.
+    a = GpuView("A", 24000, used_smi=24000, ready_footprint=24000)
+    res = [R("old", 12000, NOW - 900, loaded_at=OLD, colocate=True),
+           R("new", 12000, NOW - 5, loaded_at=OLD, colocate=True)]
+    uuid, ev = select_colocated([a], {"A": res}, 10000, NOW, 90)
+    assert uuid == "A" and ev == ["old"], (uuid, ev)  # evict just the LRU, keep the other
+
+
+def test_colocated_all_alwayson_returns_none():
+    a = GpuView("A", 24000, used_smi=24000, ready_footprint=24000)
+    res = [R("p", 24000, OLD, loaded_at=OLD, colocate=True, always_on=True)]
+    uuid, ev = select_colocated([a], {"A": res}, 10000, NOW, 90)
+    assert uuid is None, (uuid, ev)
+
+
+def test_colocated_picks_most_free_eligible():
+    a = GpuView("A", 24000, used_smi=10800, ready_footprint=10800)  # free 13200
+    b = GpuView("B", 24000, used_smi=2000, ready_footprint=2000)     # free 22000
+    rbg = {"A": [R("a1", 10800, OLD, loaded_at=OLD, colocate=True)],
+           "B": [R("b1", 2000, OLD, loaded_at=OLD, colocate=True)]}
+    uuid, ev = select_colocated([a, b], rbg, 8000, NOW, 90)
+    assert uuid == "B" and ev == []
 
 
 if __name__ == "__main__":

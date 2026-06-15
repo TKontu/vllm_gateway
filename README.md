@@ -181,8 +181,14 @@ models:
   with `tensor_parallel_size: 1` whose **weights exceed one card** auto-falls-back to the minimal TP
   that fits. TP over PCIe (no NVLink) has real comms cost, so prefer single-GPU when a model fits.
   Each card is still filled to `gpu_memory_utilization` (TP fits bigger *weights*, not more KV).
-- **No co-location.** This release does not co-locate multiple models on one card — each model gets
-  ~its whole GPU at its `gpu_memory_utilization`.
+- **Co-location.** Set `colocate: true` to let small models **share a card**. A co-locatable
+  model's `gpu_memory_utilization` is its intended per-card *share* (e.g. `0.45`, so two fit a 24 GB
+  card); the gateway caps the launch util to the chosen card's *actual free* VRAM (minus a margin,
+  `COLOCATE_MARGIN_MIB`, default 1024) so a second model never OOMs the first. Co-locatable models
+  only share with each other (a whole-card model never shares), are evicted only as needed (idle,
+  LRU), and co-location is **single-GPU only** (not combinable with `tensor_parallel_size > 1`).
+  Default (`colocate: false`) keeps whole-card placement. Expect per-model throughput to drop when a
+  card is shared (contended SMs/KV) — opt in for lightly-used helpers, not your hot path.
 - **GPU source precedence.** `pools:` in config → else `GATEWAY_GPU_UUID` (a single-GPU pool) →
   else all visible GPUs (the legacy single-pool behavior). When no `pools:` are declared, behavior
   is unchanged.
