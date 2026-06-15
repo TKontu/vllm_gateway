@@ -13,13 +13,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from docker.types import DeviceRequest
 from docker.errors import NotFound, APIError
 from dataclasses import dataclass, field
+from enum import Enum
 from huggingface_hub import hf_hub_download, list_repo_files
 import yaml
 import placement
 from config_loader import (
     ModelConfig, resolve_model_configs, build_fallback_configs,
     resolve_pools, validate_model_pools, validate_tp_against_pools, validate_colocate,
-    validate_pools_visible,
+    validate_pools_visible, migrate_footprints,
 )
 
 # --- Logging Configuration ---
@@ -67,6 +68,11 @@ GATEWAY_MAX_CONCURRENT = int(os.getenv("GATEWAY_MAX_CONCURRENT", "50"))  # Max c
 # becomes a candidate for eviction-to-make-room. Eviction falls back to fresh models only if no
 # older candidate frees enough VRAM (so a single-GPU swap is never blocked). 0 disables the cooldown.
 GATEWAY_MIN_RESIDENT_SECONDS = int(os.getenv("GATEWAY_MIN_RESIDENT_SECONDS", "90"))
+
+# A LOADING entry older than this with no completed start is treated as orphaned (the start crashed
+# without running its cleanup) and reaped by the reconciler. Defaults a bit above the health-check
+# budget (~1h) so a genuinely slow cold start is never reaped mid-flight.
+GATEWAY_LOADING_TIMEOUT = int(os.getenv("GATEWAY_LOADING_TIMEOUT", "3900"))
 
 # Co-location (Phase 3): when a co-locatable model shares a card, its launch util is capped so it
 # leaves COLOCATE_MARGIN_MIB free; weights must fit util*total * COLOCATE_WEIGHT_OVERHEAD; a
@@ -126,39 +132,50 @@ def is_gpt_oss_model(model_id: str) -> bool:
 RESOLVED_DOCKER_NETWORK = None
 TOTAL_GPU_VRAM = 0  # in MiB
 GPU_VRAM = {}  # uuid -> {"total": int MiB, "used": float MiB}; per-GPU foundation for multi-GPU placement
-known_footprints = {}
-active_containers = {}
-model_management_lock = asyncio.Lock()  # For updating active_containers dict
+known_footprints = {}  # repo -> {"per_gpu_mib": float, "effective_tp": int, "measured_at": float}
+active_containers = {}  # container_name -> ContainerState (entries exist while LOADING/READY/STOPPING)
+# One lock guards ALL of active_containers: membership, status transitions, slot allocation, and the
+# VRAM accounting derived from it (reservations now live ON the entries, not in a side dict). It is
+# held ONLY for in-memory decisions/mutations — NEVER across a container start, get_gpu_vram, or
+# stop_container. Acquire order: container_start_locks[model] -> state_lock.
+state_lock = asyncio.Lock()
 container_start_locks = {}  # model_id -> asyncio.Lock for preventing concurrent container starts
 download_locks = {}  # model_id -> asyncio.Lock for preventing concurrent downloads
 
 # Multi-GPU placement state (resolved at startup; see resolve_managed_pools)
 MANAGED_POOLS = {}  # pool_name -> [gpu_uuid, ...]: the GPUs this gateway manages, grouped into pools
 MANAGED_GPUS = []   # flat list of managed gpu_uuids (union of MANAGED_POOLS values)
-gpu_reservations = {}  # gpu_uuid -> reserved MiB for models that are loading (not yet nvidia-smi visible)
-# Single global lock held ONLY for the placement decision (choose GPU + reserve), never across a
-# container start. Acquire order: container_start_locks[model] -> model_management_lock -> placement_lock.
-placement_lock = asyncio.Lock()
 
 # Queue management state
 model_semaphores = {}  # model_id -> asyncio.Semaphore for limiting concurrent requests
 model_queue_counts = {}  # model_id -> int (number of requests waiting in queue)
-queue_count_lock = asyncio.Lock()  # Protects queue counter updates
+queue_count_lock = asyncio.Lock()  # Protects ONLY the queue counter (short critical sections)
+
+class ContainerStatus(str, Enum):
+    LOADING = "loading"    # reserved + container starting; visible to placement/accounting, NOT routable
+    READY = "ready"        # health-passed; routable
+    STOPPING = "stopping"  # being drained/removed; excluded from fit math, NOT routable
 
 @dataclass
 class ContainerState:
     model_id: str
     container_name: str
-    ip_address: str
-    port: int
-    last_request_time: float
-    vram_footprint: float # in MiB
-    active_requests: int = 0  # number of requests currently being proxied to this container
-    always_on: bool = False  # if True, never auto-unloaded by the inactivity monitor
+    status: "ContainerStatus"
+    gpu_uuids: list                 # GPU UUID(s) this container is pinned to (set at LOADING)
+    reserved_mib: float             # optimistic VRAM claim while LOADING (the reservation; one source of truth)
+    effective_tp: int = 1           # tensor-parallel degree actually launched
+    effective_util: float = 0.0     # gpu-memory-utilization actually launched (0 => model default)
+    colocate: bool = False          # may share its GPU with other co-locatable models (Phase 3)
+    always_on: bool = False         # if True, never auto-unloaded by the inactivity monitor
     inactivity_timeout: int = VLLM_INACTIVITY_TIMEOUT  # per-model idle timeout (seconds; 0 = never unload)
-    loaded_at: float = 0.0  # time.time() when the container became ready (for anti-thrash cooldown)
-    gpu_uuids: list = field(default_factory=list)  # GPU UUID(s) this container is pinned to
-    colocate: bool = False  # may share its GPU with other co-locatable models (Phase 3)
+    created_at: float = 0.0         # time.time() when the LOADING entry was inserted (reconciler orphan reaping)
+    # Populated when READY:
+    ip_address: str = ""
+    port: int = 0
+    vram_footprint: float = 0.0     # measured/known per-GPU footprint (meaningful once READY)
+    last_request_time: float = 0.0
+    active_requests: int = 0        # in-flight requests being proxied to this container
+    loaded_at: float = 0.0          # time.time() when it became READY (anti-thrash cooldown)
 
 # --- Docker and HTTP Clients ---
 docker_client = docker.from_env()
@@ -317,8 +334,11 @@ def load_known_footprints():
                 known_footprints = {}
                 return
             with open(MEMORY_FOOTPRINT_FILE, 'r') as f:
-                known_footprints = json.load(f)
-            logging.info(f"Loaded known model footprints: {known_footprints}")
+                raw = json.load(f)
+            # Normalize to the record shape {repo: {per_gpu_mib, effective_tp, measured_at}},
+            # migrating the legacy {repo: number} format forward (assume tp=1).
+            known_footprints = migrate_footprints(raw)
+            logging.info(f"Loaded known model footprints ({len(known_footprints)} record(s)).")
         else:
             logging.info(f"Memory footprints file not found, creating new one at {MEMORY_FOOTPRINT_FILE}")
             known_footprints = {}
@@ -602,29 +622,39 @@ ALLOWED_MODELS = {name: cfg.repo for name, cfg in MODEL_CONFIGS.items()}
 # --- Background Tasks ---
 
 async def shutdown_inactive_containers():
-    """A background task that checks for inactivity and shuts down containers.
+    """Background monitor: unload idle READY containers AND reconcile orphaned state.
 
-    Each container uses its own resolved inactivity_timeout. Containers whose model
-    is marked always_on (or whose timeout is 0) are never auto-unloaded.
+    Inactivity: each READY container uses its own resolved inactivity_timeout; always_on (or
+    timeout 0) is never unloaded. Reconciliation: a LOADING entry older than
+    GATEWAY_LOADING_TIMEOUT is an orphan (its start crashed without cleanup) and is dropped so its
+    reserved VRAM is reclaimed — this is what makes reservation/slot leaks self-healing.
     """
-    logging.info("Starting inactivity monitor (per-model timeouts; always_on models are never unloaded).")
+    logging.info("Starting inactivity monitor + reconciler (per-model timeouts; always_on never unloaded).")
     while True:
         try:
             await asyncio.sleep(60)
-
-            # Determine which containers are inactive with lock
-            async with model_management_lock:
-                current_time = time.time()
-                inactive_containers = []
+            now = time.time()
+            inactive_containers = []
+            orphans = []
+            async with state_lock:
                 for name, state in active_containers.items():
-                    if state.always_on:
+                    if state.status == ContainerStatus.LOADING:
+                        if now - state.created_at > GATEWAY_LOADING_TIMEOUT:
+                            orphans.append(name)
                         continue
-                    if state.inactivity_timeout <= 0:
-                        continue  # 0 = never unload
-                    if current_time - state.last_request_time > state.inactivity_timeout:
+                    if state.status != ContainerStatus.READY:
+                        continue  # STOPPING is owned by stop_container
+                    if state.always_on or state.inactivity_timeout <= 0:
+                        continue
+                    if now - state.last_request_time > state.inactivity_timeout:
                         inactive_containers.append(name)
+                # Reap orphaned LOADING entries in-place (no container to stop — start never finished).
+                for name in orphans:
+                    logging.warning(f"Reaping orphaned LOADING entry {name} "
+                                    f"(age > {GATEWAY_LOADING_TIMEOUT}s); reclaiming its reservation.")
+                    active_containers.pop(name, None)
 
-            # Stop containers outside lock (I/O operation)
+            # Stop idle containers outside the lock (I/O).
             for name in inactive_containers:
                 logging.info(f"Container {name} has been idle. Shutting down.")
                 await stop_container(name)
@@ -633,12 +663,16 @@ async def shutdown_inactive_containers():
             logging.error(f"Error in inactivity monitor: {e}", exc_info=True)
 
 async def stop_container(container_name: str, drain_timeout: float = 30.0):
-    """Stops and removes a container with graceful draining of in-flight requests."""
-    # Step 1: Remove from routing so no new requests are dispatched to it
-    async with model_management_lock:
-        state = active_containers.pop(container_name, None)
+    """Gracefully stop+remove a container: flip STOPPING (off routing + fit math), drain in-flight,
+    docker stop/remove, then drop the entry. The entry stays present (STOPPING) during the drain so
+    no new request routes to it and its VRAM isn't double-freed in accounting (still in used_smi)."""
+    # Step 1: mark STOPPING (keep the entry; it's excluded from routing and fit math while stopping).
+    async with state_lock:
+        state = active_containers.get(container_name)
+        if state is not None:
+            state.status = ContainerStatus.STOPPING
 
-    # Step 2: Wait for any in-flight requests to complete before killing the container
+    # Step 2: wait for in-flight requests to finish before killing the container.
     if state and state.active_requests > 0:
         logging.info(f"Draining {state.active_requests} in-flight request(s) from {container_name} (timeout {drain_timeout}s)...")
         deadline = time.time() + drain_timeout
@@ -647,7 +681,7 @@ async def stop_container(container_name: str, drain_timeout: float = 30.0):
         if state.active_requests > 0:
             logging.warning(f"Container {container_name} still had {state.active_requests} active request(s) after drain timeout; force stopping.")
 
-    # Step 3: Stop and remove the Docker container
+    # Step 3: stop and remove the Docker container.
     try:
         container = await run_in_executor(docker_client.containers.get, container_name)
         logging.info(f"Stopping container {container_name}...")
@@ -658,6 +692,10 @@ async def stop_container(container_name: str, drain_timeout: float = 30.0):
         logging.warning(f"Attempted to stop container {container_name}, but it was not found.")
     except APIError as e:
         logging.error(f"Error stopping or removing container {container_name}: {e}")
+    finally:
+        # Step 4: drop the entry (single removal site for a STOPPING entry).
+        async with state_lock:
+            active_containers.pop(container_name, None)
 
 async def hf_repo_exists(repo_id: str) -> bool:
     """Return True if repo_id has a readable config.json on HuggingFace."""
@@ -771,14 +809,15 @@ def merge_extra_args(base: "list[str]", extra: "list[str]") -> "list[str]":
 async def start_model_container(model_id: str, container_name: str, model_cfg: ModelConfig,
                                 gpu_uuids: "list[str] | None" = None,
                                 effective_tp: "int | None" = None,
-                                effective_util: "float | None" = None) -> ContainerState | None:
-    """Starts a new vLLM container using the model's resolved configuration.
+                                effective_util: "float | None" = None) -> "tuple | None":
+    """Start a vLLM container and wait until healthy. Returns (ip_address, port) on success, or
+    None on failure/timeout. Does NOT touch active_containers — the caller owns that entry's
+    lifecycle (it inserts a LOADING entry before calling this, and flips it READY / drops it after).
 
-    gpu_uuids pins the container to specific GPU(s) (multi-GPU placement). When None/empty,
-    falls back to GPU_DEVICE_REQUESTS (the gateway-wide pin or all GPUs) for backward compat.
-    effective_tp overrides --tensor-parallel-size (for TP fallback); effective_util overrides
-    --gpu-memory-utilization (for co-location). Both default to the model's configured values.
-    model_cfg is never mutated (it is shared across requests)."""
+    gpu_uuids pins the container to specific GPU(s). When None/empty, falls back to
+    GPU_DEVICE_REQUESTS (the gateway-wide pin or all GPUs). effective_tp/effective_util override
+    --tensor-parallel-size / --gpu-memory-utilization; both default to the model's configured
+    values. model_cfg is never mutated (it is shared across requests)."""
     tp = effective_tp if effective_tp else model_cfg.tensor_parallel_size
     util = effective_util if effective_util is not None else model_cfg.gpu_memory_utilization
     logging.info(f"Attempting to start model {model_id} in container {container_name}")
@@ -834,7 +873,7 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
 
     if is_gguf_repo(resolved_model_id):
         # Ensure only one download per model at a time (protect lock creation with global lock)
-        async with model_management_lock:
+        async with state_lock:
             if model_id not in download_locks:
                 download_locks[model_id] = asyncio.Lock()
             download_lock = download_locks[model_id]
@@ -986,19 +1025,8 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
                 if response.status_code == 200:
                     elapsed_time = (i + 1) * 2
                     logging.info(f"Model {model_id} started successfully at {vllm_base_url} after {elapsed_time}s.")
-                    return ContainerState(
-                        model_id=model_id,
-                        container_name=container_name,
-                        ip_address=ip_address,
-                        port=VLLM_PORT,
-                        last_request_time=time.time(),
-                        vram_footprint=0, # Footprint is unknown until measured
-                        always_on=model_cfg.always_on,
-                        inactivity_timeout=model_cfg.inactivity_timeout,
-                        loaded_at=time.time(),
-                        gpu_uuids=list(gpu_uuids) if gpu_uuids else [],
-                        colocate=model_cfg.colocate,
-                    )
+                    # Return runtime fields only; the caller owns the active_containers entry lifecycle.
+                    return (ip_address, VLLM_PORT)
                 elif response.status_code != 503:
                     # 503 is expected during vLLM initialization; anything else is worth noting
                     logging.warning(f"Unexpected health check status {response.status_code} for {model_id} (attempt {i+1})")
@@ -1038,10 +1066,8 @@ async def gateway_status():
     Snapshots the shared state under the locks that guard it, then builds the response from
     the copies — so a concurrent mutation can't raise 'dict changed size during iteration'
     (this endpoint runs in a threadpool, truly concurrent with the event loop)."""
-    async with model_management_lock:
-        async with placement_lock:
-            containers = {name: dict(state.__dict__) for name, state in active_containers.items()}
-            reservations = dict(gpu_reservations)
+    async with state_lock:
+        containers = {name: dict(state.__dict__) for name, state in active_containers.items()}
         gpu_vram = {u: dict(v) for u, v in GPU_VRAM.items()}
         pools = {p: list(u) for p, u in MANAGED_POOLS.items()}
         footprints = dict(known_footprints)
@@ -1053,12 +1079,16 @@ async def gateway_status():
     gpus_status = {}
     for guid in managed:
         v = gpu_vram.get(guid, {})
-        residents = [c["container_name"] for c in containers.values() if guid in c.get("gpu_uuids", [])]
+        # reserved = LOADING entries on this GPU; residents = LOADING/READY (exclude STOPPING).
+        reserved = sum(c.get("reserved_mib", 0.0) for c in containers.values()
+                       if guid in c.get("gpu_uuids", []) and c.get("status") == ContainerStatus.LOADING)
+        residents = [c["container_name"] for c in containers.values()
+                     if guid in c.get("gpu_uuids", []) and c.get("status") != ContainerStatus.STOPPING]
         gpus_status[guid] = {
             "pool": uuid_to_pool.get(guid),
             "total_mib": v.get("total"),
             "used_mib": v.get("used"),
-            "reserved_mib": reservations.get(guid, 0.0),
+            "reserved_mib": reserved,
             "residents": residents,
         }
     model_ids = set(list(queue_counts.keys()) + [c["model_id"] for c in containers.values()])
@@ -1077,6 +1107,213 @@ async def gateway_status():
             for model_id in model_ids
         }
     }
+
+# --- Placement helpers (the LOADING/READY/STOPPING lifecycle) ---
+
+def _build_gpu_views(pool_gpus, gpus_snapshot):
+    """Build (candidates, residents_by_gpu, blocked_gpus) for placement. MUST be called under
+    state_lock (reads active_containers). READY entries are eviction candidates + ready_footprint;
+    LOADING entries fold into GpuView.reserved; STOPPING entries are excluded from both. A GPU with
+    any non-colocate LOADING/READY occupant is 'blocked' for co-location (closes F7)."""
+    candidates = []
+    residents_by_gpu = {}
+    blocked = set()
+    for guid in pool_gpus:
+        g = gpus_snapshot.get(guid)
+        on_gpu = [c for c in active_containers.values()
+                  if guid in c.gpu_uuids and c.status != ContainerStatus.STOPPING]
+        ready = [c for c in on_gpu if c.status == ContainerStatus.READY]
+        loading = [c for c in on_gpu if c.status == ContainerStatus.LOADING]
+        residents_by_gpu[guid] = ready  # eviction candidates are READY only
+        candidates.append(placement.GpuView(
+            uuid=guid,
+            total=float(g["total"]) if g else 0.0,
+            used_smi=float(g["used"]) if g else 0.0,
+            reserved=sum(c.reserved_mib for c in loading),
+            ready_footprint=sum(c.vram_footprint for c in ready),
+        ))
+        if any(not c.colocate for c in on_gpu):
+            blocked.add(guid)
+    return candidates, residents_by_gpu, blocked
+
+async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, effective_tp,
+                              effective_util, run_discovery, before_used, meas_gpu):
+    """Start the container for an already-inserted LOADING `entry`, then flip it READY (or drop it
+    on failure — the single cleanup site). Whole-card discovery refines the footprint after READY."""
+    try:
+        runtime = await start_model_container(
+            target_model_id, entry.container_name, model_cfg,
+            gpu_uuids=gpu_uuids, effective_tp=effective_tp, effective_util=effective_util)
+    except BaseException:
+        async with state_lock:
+            active_containers.pop(entry.container_name, None)  # drop LOADING on any failure/cancel
+        raise
+    if not runtime:
+        async with state_lock:
+            active_containers.pop(entry.container_name, None)
+        return None
+
+    ip_address, port = runtime
+    async with state_lock:
+        entry.ip_address = ip_address
+        entry.port = port
+        entry.status = ContainerStatus.READY
+        entry.loaded_at = time.time()
+        entry.last_request_time = time.time()
+        # vram_footprint already seeded with reserved_mib at insert; discovery refines it below.
+        entry.vram_footprint = entry.reserved_mib
+
+    # Whole-card discovery: measure the per-GPU footprint on one chosen GPU and persist it.
+    if run_discovery and meas_gpu:
+        logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
+        samples = []
+        for _ in range(3):
+            await asyncio.sleep(15)
+            samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
+        measured = max(samples) - before_used
+        if measured > 256:
+            logging.info(f"Measured per-GPU footprint for {target_model_id} on {meas_gpu}: {measured} MiB")
+            entry.vram_footprint = measured
+            known_footprints[target_model_id] = {
+                "per_gpu_mib": float(measured), "effective_tp": effective_tp, "measured_at": time.time()}
+        else:
+            logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); keeping estimate.")
+            known_footprints[target_model_id] = {
+                "per_gpu_mib": 0.0, "effective_tp": effective_tp, "measured_at": time.time()}  # sentinel
+        await save_known_footprints_async()
+    return entry
+
+async def _ensure_started(target_model_id, model_cfg):
+    """Ensure a READY container exists for the model and return it (or None on failure).
+
+    The caller holds container_start_locks[target_model_id], so no other start for THIS model runs
+    concurrently. Inserts a LOADING entry under state_lock (reserving VRAM + slot atomically), then
+    starts + finalizes outside the lock."""
+    # Became READY since the fast-path check?
+    async with state_lock:
+        ready = next((c for c in active_containers.values()
+                      if c.model_id == target_model_id and c.status == ContainerStatus.READY), None)
+    if ready is not None:
+        return ready
+
+    record = known_footprints.get(target_model_id)          # None | {per_gpu_mib, effective_tp, measured_at}
+    is_discovery = record is None
+    prior_tp = record.get("effective_tp") if record else None
+    learned_mib = float(record.get("per_gpu_mib", 0.0)) if record else 0.0
+    pool = pool_for(model_cfg)
+    pool_gpus = MANAGED_POOLS.get(pool, [])
+    is_colocate = model_cfg.colocate
+    util = model_cfg.gpu_memory_utilization
+
+    # Degraded mode: VRAM accounting unavailable. One container at a time, but still record a
+    # proper entry and honor gpu_uuids (pin/pool) so device pinning + /status stay consistent (F5).
+    if TOTAL_GPU_VRAM <= 0:
+        async with state_lock:
+            to_stop = [n for n, c in active_containers.items() if c.status != ContainerStatus.STOPPING]
+        for n in to_stop:
+            await stop_container(n)
+        gpu_uuids = list(pool_gpus) if pool_gpus else list(MANAGED_GPUS)
+        async with state_lock:
+            slot_indices = {int(n.split('_')[-1]) for n in active_containers.keys()}
+            free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
+            entry = ContainerState(
+                model_id=target_model_id, container_name=f"{VLLM_CONTAINER_PREFIX}_{free_slot}",
+                status=ContainerStatus.LOADING, gpu_uuids=gpu_uuids, reserved_mib=0.0,
+                effective_tp=model_cfg.tensor_parallel_size, colocate=is_colocate,
+                always_on=model_cfg.always_on, inactivity_timeout=model_cfg.inactivity_timeout,
+                created_at=time.time())
+            active_containers[entry.container_name] = entry
+        return await _start_and_finalize(
+            entry, target_model_id, model_cfg, gpu_uuids=gpu_uuids or None,
+            effective_tp=model_cfg.tensor_parallel_size, effective_util=None,
+            run_discovery=False, before_used=0.0, meas_gpu=None)
+
+    if not pool_gpus:
+        raise HTTPException(status_code=500,
+                            detail=f"Pool '{pool}' for model {target_model_id} has no managed GPUs")
+
+    gpus_snapshot = await get_gpu_vram()  # OUTSIDE state_lock (spawns a container)
+    pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
+    max_total = max(pool_totals) if pool_totals else 0.0
+
+    # Effective TP — deterministic every request (F2). The HF weight estimate is fetched ONLY for an
+    # unseen model (no prior record) that is TP-eligible; a seen model reuses its persisted decision.
+    if is_colocate:
+        effective_tp = 1
+    elif model_cfg.tensor_parallel_size > 1:
+        effective_tp = model_cfg.tensor_parallel_size
+    elif prior_tp is not None:
+        effective_tp = max(1, prior_tp)              # seen before -> reuse persisted tp, no HF call
+    else:
+        wbytes = None
+        if (len(pool_gpus) >= 2 and max_total > 0
+                and (max(pool_totals) - min(pool_totals)) <= 0.05 * max_total):
+            wbytes = await estimate_weight_bytes(target_model_id)
+        effective_tp = placement.compute_effective_tp(wbytes, model_cfg.tensor_parallel_size,
+                                                      prior_tp, pool_totals, util)
+
+    # Per-card need (F9): learned per-GPU footprint when known(>0), else util * that card's total.
+    need_fn = (lambda g: learned_mib) if learned_mib > 0 else (lambda g: util * g.total)
+    colocate_wbytes = await estimate_weight_bytes(target_model_id) if is_colocate else None
+
+    # DECIDE + reserve + insert LOADING — under state_lock (no I/O inside).
+    async with state_lock:
+        candidates, residents_by_gpu, blocked = _build_gpu_views(pool_gpus, gpus_snapshot)
+        if is_colocate:
+            uuid, evictions = placement.select_colocated(
+                candidates, residents_by_gpu, need_fn, blocked, time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
+            chosen_uuids = [uuid] if uuid is not None else None
+        else:
+            chosen_uuids, evictions = placement.select_placement(
+                candidates, residents_by_gpu, need_fn, effective_tp, time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
+        if chosen_uuids is None:
+            raise HTTPException(
+                status_code=503,
+                detail=(f"Cannot place model {target_model_id} in pool '{pool}' "
+                        f"({'colocate' if is_colocate else f'tp={effective_tp}'}): no GPU available without "
+                        f"evicting always_on/in-flight models (or pool not homogeneous / too few GPUs for TP)."))
+
+        chosen_gv = next(c for c in candidates if c.uuid == chosen_uuids[0])
+        if is_colocate:
+            freed = sum(r.vram_footprint for r in residents_by_gpu[chosen_uuids[0]]
+                        if r.container_name in evictions)
+            total = chosen_gv.total or max_total
+            budget = max(0.0, chosen_gv.free + freed - COLOCATE_MARGIN_MIB)
+            effective_util = min(util, (budget / total) if total > 0 else util)
+            if colocate_wbytes:
+                need_mib = (colocate_wbytes / (1024.0 * 1024.0)) * COLOCATE_WEIGHT_OVERHEAD
+                if effective_util * total < need_mib:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=(f"Cannot co-locate {target_model_id} on {chosen_uuids[0]}: budget "
+                                f"~{int(effective_util * total)} MiB < weights ~{int(need_mib)} MiB."))
+            reserve_amt = effective_util * total
+        else:
+            effective_util = None
+            reserve_amt = need_fn(chosen_gv)
+
+        slot_indices = {int(n.split('_')[-1]) for n in active_containers.keys()}
+        free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
+        entry = ContainerState(
+            model_id=target_model_id, container_name=f"{VLLM_CONTAINER_PREFIX}_{free_slot}",
+            status=ContainerStatus.LOADING, gpu_uuids=list(chosen_uuids), reserved_mib=reserve_amt,
+            effective_tp=effective_tp, effective_util=effective_util or 0.0, colocate=is_colocate,
+            always_on=model_cfg.always_on, inactivity_timeout=model_cfg.inactivity_timeout,
+            created_at=time.time())
+        active_containers[entry.container_name] = entry
+        logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', "
+                     f"{'colocate util=%.3f' % effective_util if is_colocate else 'tp=%d' % effective_tp}, "
+                     f"~{int(reserve_amt)} MiB/GPU); evicting {evictions or 'nothing'}; slot {entry.container_name}.")
+
+    # Evict + start OUTSIDE the lock.
+    for name in evictions:
+        await stop_container(name)
+    run_discovery = is_discovery and not is_colocate
+    before_used = gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0) if run_discovery else 0.0
+    return await _start_and_finalize(
+        entry, target_model_id, model_cfg, gpu_uuids=chosen_uuids, effective_tp=effective_tp,
+        effective_util=effective_util, run_discovery=run_discovery,
+        before_used=before_used, meas_gpu=chosen_uuids[0])
 
 # Catch-all proxy route (must be last)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
@@ -1100,7 +1337,7 @@ async def proxy_request(request: Request):
 
     # Initialize semaphore for this model if not exists
     if target_model_id not in model_semaphores:
-        async with model_management_lock:
+        async with state_lock:
             if target_model_id not in model_semaphores:
                 model_semaphores[target_model_id] = asyncio.Semaphore(GATEWAY_MAX_CONCURRENT)
                 model_queue_counts[target_model_id] = 0
@@ -1153,332 +1390,117 @@ async def proxy_request(request: Request):
                 logging.debug(f"Exception cleanup (pre-acquire): decremented queue counter for {model_name}. Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
         raise
 
-    # Step 2: semaphore is held — run all logic; finally releases it unless generator took over
+    # Step 2: semaphore is held — run all logic; the finally releases it unless the streaming
+    # generator takes ownership. queue_count_lock now guards ONLY the counter (never held across
+    # placement, container start, or proxying — fixes the global-serialization bug F1).
     try:
-        # Decrement queue counter now that we have a semaphore slot
-        # CRITICAL: Mark cleanup flag BEFORE decrement to prevent double-decrement
-        # if logging.debug() fails after decrement but before flag is set
         async with queue_count_lock:
-            counter_needs_cleanup = False  # Set flag FIRST
+            counter_needs_cleanup = False  # set flag FIRST (guard against double-decrement)
             model_queue_counts[target_model_id] = max(0, model_queue_counts[target_model_id] - 1)
             logging.debug(f"Request dequeued for {model_name} ({target_model_id}). Queue depth: {model_queue_counts[target_model_id]}/{GATEWAY_MAX_QUEUE_SIZE}")
 
-            # Quick check for existing container (no lock needed for read-only check)
-            target_container: ContainerState = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
+        # Fast path: a READY container for this model already exists -> route to it.
+        async with state_lock:
+            target_container = next((c for c in active_containers.values()
+                                     if c.model_id == target_model_id
+                                     and c.status == ContainerStatus.READY), None)
 
-            if not target_container:
-                # Ensure per-model lock exists (protect lock creation with global lock)
-                async with model_management_lock:
-                    if target_model_id not in container_start_locks:
-                        container_start_locks[target_model_id] = asyncio.Lock()
-                    per_model_lock = container_start_locks[target_model_id]
+        # Slow path: ensure a container is started (serialized per model via the start lock).
+        if target_container is None:
+            async with state_lock:
+                if target_model_id not in container_start_locks:
+                    container_start_locks[target_model_id] = asyncio.Lock()
+                per_model_lock = container_start_locks[target_model_id]
+            async with per_model_lock:
+                target_container = await _ensure_started(target_model_id, model_cfg)
 
-                # Acquire per-model lock to prevent concurrent starts of the same model
-                async with per_model_lock:
-                    # Double-check after acquiring lock (another request may have started it)
-                    target_container = next((c for c in active_containers.values() if c.model_id == target_model_id), None)
+        if target_container is None:
+            raise HTTPException(status_code=500, detail=f"Failed to start or find container for model {target_model_id}")
 
-                    if not target_container:
-                        # 2. Model not running, need to start it
-                        footprint = known_footprints.get(target_model_id)
+        # Route the request (no state/queue lock held; the semaphore stays held).
+        target_container.last_request_time = time.time()
+        query_string = str(request.url.query) if request.url.query else ""
+        vllm_url = f"http://{target_container.ip_address}:{target_container.port}{request.url.path}"
+        if query_string:
+            vllm_url += f"?{query_string}"
+        current_queue_depth = model_queue_counts.get(target_model_id, 0)
 
-                        if TOTAL_GPU_VRAM > 0:
-                            # POOL-BASED PLACEMENT (whole-card by default; tensor-parallel and
-                            # co-location handled below).
-                            # known_footprints: None = never seen (discovery), 0 = seen-but-unmeasurable
-                            # sentinel, >0 = measured. is_discovery only when truly unseen.
-                            is_discovery = footprint is None
-                            pool = pool_for(model_cfg)
-                            pool_gpus = MANAGED_POOLS.get(pool, [])
-                            if not pool_gpus:
-                                raise HTTPException(status_code=500,
-                                                    detail=f"Pool '{pool}' for model {target_model_id} has no managed GPUs")
+        # Track in-flight requests for graceful draining (streaming generator owns its own decrement).
+        target_container.active_requests += 1
+        active_req_decremented = False
 
-                            # Snapshot per-GPU VRAM OUTSIDE the placement lock (it spawns a container).
-                            gpus_snapshot = await get_gpu_vram()
+        try:
+            body['model'] = target_model_id
+            headers_to_forward = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding')
+            }
+            is_streaming = body.get('stream', False)
+            queue_headers = {
+                "X-Queue-Depth": str(current_queue_depth),
+                "X-Max-Concurrent": str(GATEWAY_MAX_CONCURRENT),
+                "X-Max-Queue-Size": str(GATEWAY_MAX_QUEUE_SIZE)
+            }
+            if is_streaming:
+                # The generator owns BOTH the active_requests decrement AND the semaphore release,
+                # so both fire after the last byte (or client disconnect), enforcing MAX_CONCURRENT
+                # for the full stream duration.
+                captured_container = target_container
+                captured_sem = sem
 
-                            pool_totals = [float(gpus_snapshot.get(u, {}).get("total", 0.0)) for u in pool_gpus]
-                            max_total = max(pool_totals) if pool_totals else 0.0
-                            is_colocate = model_cfg.colocate
-
-                            # Per-card need. Co-locatable models use their intended share (so several pack
-                            # onto a card); whole-card models use the learned footprint or a full-card estimate.
-                            if is_colocate:
-                                needed_per_gpu = model_cfg.gpu_memory_utilization * max_total
-                            elif footprint and footprint > 0:
-                                needed_per_gpu = float(footprint)
-                            else:
-                                needed_per_gpu = model_cfg.gpu_memory_utilization * max_total
-
-                            # Effective TP: forced by config, or auto-fallback for an unseen (non-colocate)
-                            # model whose weights exceed one card (only in a homogeneous, multi-GPU pool).
-                            effective_tp = model_cfg.tensor_parallel_size
-                            if (is_discovery and not is_colocate and model_cfg.tensor_parallel_size == 1
-                                    and len(pool_gpus) >= 2
-                                    and pool_totals and (max(pool_totals) - min(pool_totals)) <= 0.05 * max(pool_totals)):
-                                wbytes = await estimate_weight_bytes(target_model_id)
-                                min_tp = placement.minimal_tp_to_fit(
-                                    wbytes, max_total, model_cfg.gpu_memory_utilization, pool_size=len(pool_gpus))
-                                if min_tp > effective_tp:
-                                    logging.info(f"TP fallback for {target_model_id}: weights ~{wbytes} B -> tp={min_tp}")
-                                    effective_tp = min_tp
-
-                            # Co-location needs a weight estimate to size the launch util safely (best-effort).
-                            colocate_wbytes = await estimate_weight_bytes(target_model_id) if is_colocate else None
-
-                            # --- DECIDE: choose GPU(s) + reserve, under the global placement lock ---
-                            effective_util = None
-                            async with model_management_lock:
-                                async with placement_lock:
-                                    candidates = []
-                                    residents_by_gpu = {}
-                                    for guid in pool_gpus:
-                                        g = gpus_snapshot.get(guid)
-                                        residents = [c for c in active_containers.values() if guid in c.gpu_uuids]
-                                        residents_by_gpu[guid] = residents
-                                        candidates.append(placement.GpuView(
-                                            uuid=guid,
-                                            total=float(g["total"]) if g else 0.0,
-                                            used_smi=float(g["used"]) if g else 0.0,
-                                            reserved=gpu_reservations.get(guid, 0.0),
-                                            ready_footprint=sum(c.vram_footprint for c in residents),
-                                        ))
-
-                                    if is_colocate:
-                                        uuid, evictions = placement.select_colocated(
-                                            candidates, residents_by_gpu, needed_per_gpu,
-                                            time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
-                                        chosen_uuids = [uuid] if uuid is not None else None
-                                    else:
-                                        chosen_uuids, evictions = placement.select_placement(
-                                            candidates, residents_by_gpu, needed_per_gpu, effective_tp,
-                                            time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
-                                    if chosen_uuids is None:
-                                        raise HTTPException(
-                                            status_code=503,
-                                            detail=(f"Cannot place model {target_model_id} in pool '{pool}' "
-                                                    f"({'colocate' if is_colocate else f'tp={effective_tp}'}, ~{int(needed_per_gpu)} MiB/GPU): "
-                                                    f"no GPU available without evicting always_on/in-flight models "
-                                                    f"(or pool not homogeneous / too few GPUs for TP). Retry later."))
-
-                                    # Co-location: size the launch util from the chosen card's free space
-                                    # (after this model's evictions), capped by the configured share and a margin.
-                                    chosen_gv = next(c for c in candidates if c.uuid == chosen_uuids[0])
-                                    if is_colocate:
-                                        freed = sum(r.vram_footprint for r in residents_by_gpu[chosen_uuids[0]]
-                                                    if r.container_name in evictions)
-                                        post_free = chosen_gv.free + freed
-                                        total = chosen_gv.total or max_total
-                                        budget = max(0.0, post_free - COLOCATE_MARGIN_MIB)
-                                        effective_util = min(model_cfg.gpu_memory_utilization,
-                                                             (budget / total) if total > 0 else model_cfg.gpu_memory_utilization)
-                                        # Weights floor: refuse a budget that can't hold the weights (would OOM).
-                                        if colocate_wbytes:
-                                            need_mib = (colocate_wbytes / (1024.0 * 1024.0)) * COLOCATE_WEIGHT_OVERHEAD
-                                            if effective_util * total < need_mib:
-                                                raise HTTPException(
-                                                    status_code=503,
-                                                    detail=(f"Cannot co-locate {target_model_id} on {chosen_uuids[0]}: budget "
-                                                            f"~{int(effective_util * total)} MiB < weights ~{int(need_mib)} MiB. Retry later."))
-                                        reserve_amt = effective_util * total
-                                    else:
-                                        reserve_amt = needed_per_gpu
-
-                                    for u in chosen_uuids:
-                                        gpu_reservations[u] = gpu_reservations.get(u, 0.0) + reserve_amt
-                                    slot_indices = {int(name.split('_')[-1]) for name in active_containers.keys()}
-                                    free_slot = next(i for i in range(len(slot_indices) + 1) if i not in slot_indices)
-                                    container_name = f"{VLLM_CONTAINER_PREFIX}_{free_slot}"
-                                    logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', "
-                                                 f"{'colocate util=%.3f' % effective_util if is_colocate else 'tp=%d' % effective_tp}, "
-                                                 f"~{int(reserve_amt)} MiB/GPU); evicting {evictions or 'nothing'}; slot {container_name}.")
-
-                            # --- Evictions + start happen OUTSIDE the locks (I/O) ---
-                            for name in evictions:
-                                await stop_container(name)
-
-                            # Discovery (whole-card models only): measure the per-GPU footprint delta.
-                            run_discovery = is_discovery and not is_colocate
-                            before_used = gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0) if run_discovery else 0.0
-
-                            try:
-                                target_container = await start_model_container(
-                                    target_model_id, container_name, model_cfg,
-                                    gpu_uuids=chosen_uuids, effective_tp=effective_tp, effective_util=effective_util)
-                                if target_container:
-                                    # Seed footprint so concurrent placement counts these GPU(s) as occupied.
-                                    # Co-location: deterministic (vLLM grabs ~util*total). Whole-card: refined by discovery.
-                                    target_container.vram_footprint = reserve_amt
-                                    async with model_management_lock:
-                                        active_containers[container_name] = target_container
-                            finally:
-                                # Always release the optimistic reservation on ALL chosen GPUs.
-                                async with placement_lock:
-                                    for u in chosen_uuids:
-                                        gpu_reservations[u] = max(0.0, gpu_reservations.get(u, 0.0) - reserve_amt)
-
-                            if target_container and run_discovery:
-                                meas_gpu = chosen_uuids[0]
-                                logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
-                                samples = []
-                                for _ in range(3):
-                                    await asyncio.sleep(15)
-                                    samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
-                                measured = max(samples) - before_used
-                                if measured > 256:
-                                    logging.info(f"Measured per-GPU footprint for {target_model_id} on {meas_gpu}: {measured} MiB")
-                                    target_container.vram_footprint = measured
-                                    known_footprints[target_model_id] = measured
-                                else:
-                                    logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); "
-                                                    f"keeping whole-card estimate {int(needed_per_gpu)} MiB.")
-                                    known_footprints[target_model_id] = 0  # sentinel: seen but unmeasurable
-                                await save_known_footprints_async()
-
-                        else: # Fallback if VRAM management is disabled
-                            # Without VRAM management, only run one container at a time
-                            # Stop all existing containers to prevent name conflicts
-                            async with model_management_lock:
-                                if active_containers:
-                                    logging.info(f"No dynamic VRAM management. Stopping all {len(active_containers)} active containers.")
-                                    container_names_to_stop = list(active_containers.keys())
-                                else:
-                                    container_names_to_stop = []
-
-                            # Evict all containers outside lock (I/O operation)
-                            for name in container_names_to_stop:
-                                await stop_container(name)
-
-                            container_name = f"{VLLM_CONTAINER_PREFIX}_0"
-                            # Start container outside lock (long I/O operation)
-                            target_container = await start_model_container(target_model_id, container_name, model_cfg)
-                            if target_container:
-                                # Update active_containers with lock
-                                async with model_management_lock:
-                                    active_containers[container_name] = target_container
-
-            # Outside all locks - check if we have a container
-            if not target_container:
-                raise HTTPException(status_code=500, detail=f"Failed to start or find container for model {target_model_id}")
-
-            # Update last request time (no lock needed - single attribute write)
-            target_container.last_request_time = time.time()
-
-            # Build full URL with query parameters
-            query_string = str(request.url.query) if request.url.query else ""
-            vllm_url = f"http://{target_container.ip_address}:{target_container.port}{request.url.path}"
-            if query_string:
-                vllm_url += f"?{query_string}"
-
-            # Get current queue depth for headers
-            current_queue_depth = model_queue_counts.get(target_model_id, 0)
-
-            # Track in-flight requests for graceful container draining.
-            # For streaming, the generator owns the decrement (it runs after this function returns).
-            # For non-streaming, the finally block below decrements.
-            target_container.active_requests += 1
-            active_req_decremented = False
-
-            # Request proxying happens outside all locks
-            try:
-                # Update model field in body before proxying
-                body['model'] = target_model_id
-
-                # Forward relevant headers (exclude hop-by-hop headers)
-                headers_to_forward = {
-                    k: v for k, v in request.headers.items()
-                    if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding')
-                }
-
-                # Check if this is a streaming request
-                is_streaming = body.get('stream', False)
-
-                # Add queue status headers to response
-                queue_headers = {
-                    "X-Queue-Depth": str(current_queue_depth),
-                    "X-Max-Concurrent": str(GATEWAY_MAX_CONCURRENT),
-                    "X-Max-Queue-Size": str(GATEWAY_MAX_QUEUE_SIZE)
-                }
-
-                if is_streaming:
-                    # True streaming: open the connection and yield chunks as they arrive.
-                    # http_client.stream() keeps the connection alive while the generator runs.
-                    # The generator owns BOTH active_requests decrement AND semaphore release,
-                    # so both fire after the last byte is sent (or client disconnects), not when
-                    # StreamingResponse is constructed and proxy_request returns.
-                    captured_container = target_container
-                    captured_sem = sem
-
-                    async def stream_generate():
-                        try:
-                            async with http_client.stream(
-                                request.method, vllm_url,
-                                json=body, headers=headers_to_forward
-                            ) as r:
-                                async for chunk in r.aiter_bytes():
-                                    if chunk:
-                                        yield chunk
-                        finally:
-                            captured_container.active_requests -= 1
-                            captured_sem.release()  # enforce GATEWAY_MAX_CONCURRENT for full stream duration
-
-                    sem_released = True        # generator takes ownership of sem.release()
-                    active_req_decremented = True  # generator owns active_requests decrement
-
-                    return StreamingResponse(
-                        stream_generate(),
-                        status_code=200,
-                        media_type="text/event-stream",
-                        headers=queue_headers
-                    )
-                else:
-                    # Non-streaming: buffer full response, then return.
-                    # Retry only transient connection errors; HTTP errors are not retried.
-                    max_retries = 3
-                    retry_delay = 1.0  # seconds
-
-                    for retry_attempt in range(max_retries):
-                        try:
-                            response = await http_client.request(
-                                method=request.method,
-                                url=vllm_url,
-                                json=body,
-                                headers=headers_to_forward
-                            )
-                            response.raise_for_status()
-                            break  # Success - exit retry loop
-                        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
-                            if retry_attempt < max_retries - 1:
-                                logging.warning(f"Transient connection error to vLLM for {model_name} (attempt {retry_attempt + 1}/{max_retries}): {type(e).__name__}. Retrying in {retry_delay}s...")
-                                await asyncio.sleep(retry_delay)
-                                retry_delay *= 1.5  # Exponential backoff
-                            else:
-                                logging.error(f"Failed to connect to vLLM for {model_name} after {max_retries} attempts: {type(e).__name__}: {str(e)}")
-                                raise  # Re-raise to trigger httpx.RequestError handler below
-
+                async def stream_generate():
                     try:
-                        content = response.json()
-                    except Exception:
-                        content = {"error": "Non-JSON response from vLLM", "raw": response.text[:500]}
-                        logging.warning(f"Non-JSON response from vLLM for {model_name}: status={response.status_code}, body={response.text[:200]}")
-                    return JSONResponse(
-                        content=content,
-                        status_code=response.status_code,
-                        headers=queue_headers
-                    )
-            except httpx.HTTPStatusError as e:
-                logging.error(f"vLLM returned HTTP error for {model_name} ({target_model_id}): {e.response.status_code} - {str(e)}")
-                return JSONResponse(
-                    {"error": "Error from vLLM service", "details": str(e)},
-                    status_code=e.response.status_code,
-                    headers={"X-Queue-Depth": str(current_queue_depth)}
-                )
-            except httpx.RequestError as e:
-                logging.error(f"Connection error to vLLM for {model_name} ({target_model_id}) at {vllm_url}: {type(e).__name__}: {str(e)}")
-                raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
-            finally:
-                if not active_req_decremented:
-                    target_container.active_requests -= 1
+                        async with http_client.stream(
+                            request.method, vllm_url,
+                            json=body, headers=headers_to_forward
+                        ) as r:
+                            async for chunk in r.aiter_bytes():
+                                if chunk:
+                                    yield chunk
+                    finally:
+                        captured_container.active_requests -= 1
+                        captured_sem.release()
+
+                sem_released = True
+                active_req_decremented = True
+                return StreamingResponse(
+                    stream_generate(), status_code=200,
+                    media_type="text/event-stream", headers=queue_headers)
+            else:
+                # Non-streaming: buffer the full response. Retry only transient connection errors.
+                max_retries = 3
+                retry_delay = 1.0
+                for retry_attempt in range(max_retries):
+                    try:
+                        response = await http_client.request(
+                            method=request.method, url=vllm_url, json=body, headers=headers_to_forward)
+                        response.raise_for_status()
+                        break
+                    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as e:
+                        if retry_attempt < max_retries - 1:
+                            logging.warning(f"Transient connection error to vLLM for {model_name} (attempt {retry_attempt + 1}/{max_retries}): {type(e).__name__}. Retrying in {retry_delay}s...")
+                            await asyncio.sleep(retry_delay)
+                            retry_delay *= 1.5
+                        else:
+                            logging.error(f"Failed to connect to vLLM for {model_name} after {max_retries} attempts: {type(e).__name__}: {str(e)}")
+                            raise
+                try:
+                    content = response.json()
+                except Exception:
+                    content = {"error": "Non-JSON response from vLLM", "raw": response.text[:500]}
+                    logging.warning(f"Non-JSON response from vLLM for {model_name}: status={response.status_code}, body={response.text[:200]}")
+                return JSONResponse(content=content, status_code=response.status_code, headers=queue_headers)
+        except httpx.HTTPStatusError as e:
+            logging.error(f"vLLM returned HTTP error for {model_name} ({target_model_id}): {e.response.status_code} - {str(e)}")
+            return JSONResponse(
+                {"error": "Error from vLLM service", "details": str(e)},
+                status_code=e.response.status_code, headers={"X-Queue-Depth": str(current_queue_depth)})
+        except httpx.RequestError as e:
+            logging.error(f"Connection error to vLLM for {model_name} ({target_model_id}) at {vllm_url}: {type(e).__name__}: {str(e)}")
+            raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
+        finally:
+            if not active_req_decremented:
+                target_container.active_requests -= 1
     except BaseException:
         # Exception cleanup: If the counter was incremented but never decremented
         # (because exception occurred before or during the decrement operation),

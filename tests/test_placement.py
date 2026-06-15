@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
 from placement import (  # noqa: E402
     select_evictions, select_gpu, GpuView, select_placement, minimal_tp_to_fit, _homogeneous,
-    select_colocated,
+    select_colocated, compute_effective_tp,
 )
 
 
@@ -111,7 +111,7 @@ def test_gpuview_free_floors_used_by_ready_footprint():
 def test_select_gpu_direct_fit_picks_most_free():
     a = GpuView("A", total=24000, used_smi=10000)   # free 14000
     b = GpuView("B", total=24000, used_smi=2000)     # free 22000
-    chosen, ev = select_gpu([a, b], {"A": [], "B": []}, needed=8000, now=NOW, min_resident_seconds=90)
+    chosen, ev = select_gpu([a, b], {"A": [], "B": []}, 8000, NOW, 90)
     assert chosen == "B" and ev == [], (chosen, ev)
 
 
@@ -119,7 +119,7 @@ def test_select_gpu_external_process_excludes_gpu():
     # A2000 (small, busy with an external embedder) can't fit; 3090 can.
     a2000 = GpuView("A2000", total=6000, used_smi=4000)   # free 2000
     rtx = GpuView("3090", total=24000, used_smi=0)        # free 24000
-    chosen, ev = select_gpu([a2000, rtx], {"A2000": [], "3090": []}, needed=8000, now=NOW, min_resident_seconds=90)
+    chosen, ev = select_gpu([a2000, rtx], {"A2000": [], "3090": []}, 8000, NOW, 90)
     assert chosen == "3090" and ev == []
 
 
@@ -127,7 +127,7 @@ def test_select_gpu_evicts_when_needed():
     # GPU full with one old idle resident; eviction frees enough.
     g = GpuView("A", total=24000, used_smi=20000, ready_footprint=20000)
     resident = R("old", vram_footprint=20000, last_request_time=OLD, loaded_at=OLD)
-    chosen, ev = select_gpu([g], {"A": [resident]}, needed=18000, now=NOW, min_resident_seconds=90)
+    chosen, ev = select_gpu([g], {"A": [resident]}, 18000, NOW, 90)
     assert chosen == "A" and ev == ["old"], (chosen, ev)
 
 
@@ -135,7 +135,7 @@ def test_select_gpu_no_fit_returns_none():
     # Only resident is always_on and occupies the card -> cannot fit -> None (caller 503s).
     g = GpuView("A", total=24000, used_smi=22000, ready_footprint=22000)
     pinned = R("pinned", vram_footprint=22000, last_request_time=OLD, loaded_at=OLD, always_on=True)
-    chosen, ev = select_gpu([g], {"A": [pinned]}, needed=8000, now=NOW, min_resident_seconds=90)
+    chosen, ev = select_gpu([g], {"A": [pinned]}, 8000, NOW, 90)
     assert chosen is None and ev == [], (chosen, ev)
 
 
@@ -145,7 +145,7 @@ def test_select_gpu_prefers_fewer_evictions():
     g1r = [R("g1a", 12000, OLD, loaded_at=OLD), R("g1b", 12000, OLD - 1, loaded_at=OLD)]
     g2 = GpuView("G2", total=24000, used_smi=24000, ready_footprint=24000)  # needs 1 eviction
     g2r = [R("g2a", 24000, OLD, loaded_at=OLD)]
-    chosen, ev = select_gpu([g1, g2], {"G1": g1r, "G2": g2r}, needed=20000, now=NOW, min_resident_seconds=90)
+    chosen, ev = select_gpu([g1, g2], {"G1": g1r, "G2": g2r}, 20000, NOW, 90)
     assert chosen == "G2" and ev == ["g2a"], (chosen, ev)
 
 
@@ -215,7 +215,7 @@ def test_select_placement_tp_evicts_and_dedupes():
 
 def test_colocated_empty_gpu_direct_fit():
     g = GpuView("A", 24000, used_smi=0)
-    uuid, ev = select_colocated([g], {"A": []}, 10800, NOW, 90)
+    uuid, ev = select_colocated([g], {"A": []}, 10800, set(), NOW, 90)
     assert uuid == "A" and ev == []
 
 
@@ -223,7 +223,7 @@ def test_colocated_shares_with_colocate_resident():
     # A already holds a colocate model (10800); a second colocate model (10800) fits alongside.
     a = GpuView("A", 24000, used_smi=10800, ready_footprint=10800)
     res = [R("a1", 10800, OLD, loaded_at=OLD, colocate=True)]
-    uuid, ev = select_colocated([a], {"A": res}, 10800, NOW, 90)
+    uuid, ev = select_colocated([a], {"A": res}, 10800, set(), NOW, 90)
     assert uuid == "A" and ev == [], (uuid, ev)
 
 
@@ -231,7 +231,7 @@ def test_colocated_rejects_wholecard_resident():
     # A holds a non-colocate (whole-card) model -> not eligible for co-location.
     a = GpuView("A", 24000, used_smi=12000, ready_footprint=12000)
     res = [R("wc", 12000, OLD, loaded_at=OLD, colocate=False)]
-    uuid, ev = select_colocated([a], {"A": res}, 10800, NOW, 90)
+    uuid, ev = select_colocated([a], {"A": res}, 10800, set(), NOW, 90)
     assert uuid is None, (uuid, ev)
 
 
@@ -240,14 +240,14 @@ def test_colocated_evicts_only_as_needed():
     a = GpuView("A", 24000, used_smi=24000, ready_footprint=24000)
     res = [R("old", 12000, NOW - 900, loaded_at=OLD, colocate=True),
            R("new", 12000, NOW - 5, loaded_at=OLD, colocate=True)]
-    uuid, ev = select_colocated([a], {"A": res}, 10000, NOW, 90)
+    uuid, ev = select_colocated([a], {"A": res}, 10000, set(), NOW, 90)
     assert uuid == "A" and ev == ["old"], (uuid, ev)  # evict just the LRU, keep the other
 
 
 def test_colocated_all_alwayson_returns_none():
     a = GpuView("A", 24000, used_smi=24000, ready_footprint=24000)
     res = [R("p", 24000, OLD, loaded_at=OLD, colocate=True, always_on=True)]
-    uuid, ev = select_colocated([a], {"A": res}, 10000, NOW, 90)
+    uuid, ev = select_colocated([a], {"A": res}, 10000, set(), NOW, 90)
     assert uuid is None, (uuid, ev)
 
 
@@ -256,8 +256,54 @@ def test_colocated_picks_most_free_eligible():
     b = GpuView("B", 24000, used_smi=2000, ready_footprint=2000)     # free 22000
     rbg = {"A": [R("a1", 10800, OLD, loaded_at=OLD, colocate=True)],
            "B": [R("b1", 2000, OLD, loaded_at=OLD, colocate=True)]}
-    uuid, ev = select_colocated([a, b], rbg, 8000, NOW, 90)
+    uuid, ev = select_colocated([a, b], rbg, 8000, set(), NOW, 90)
     assert uuid == "B" and ev == []
+
+
+# --- Stage 2: compute_effective_tp, per-card need_fn, blocked_gpus ---
+
+def test_compute_effective_tp():
+    totals2 = [24000, 24000]
+    # forced config tp wins
+    assert compute_effective_tp(None, 2, None, totals2, 0.9) == 2
+    # persisted prior tp reused (fixes F2 — 2nd request doesn't revert to 1)
+    assert compute_effective_tp(None, 1, 2, totals2, 0.9) == 2
+    # unseen oversized weights on homogeneous 2-GPU pool -> 2
+    assert compute_effective_tp(30 * 1024**3, 1, None, totals2, 0.9) == 2
+    # fits one card -> 1
+    assert compute_effective_tp(10 * 1024**3, 1, None, totals2, 0.9) == 1
+    # single-GPU pool -> 1 regardless
+    assert compute_effective_tp(99 * 1024**3, 1, None, [24000], 0.9) == 1
+    # heterogeneous pool -> no auto-split -> 1
+    assert compute_effective_tp(99 * 1024**3, 1, None, [24000, 6000], 0.9) == 1
+    # unknown weights -> 1
+    assert compute_effective_tp(None, 1, None, totals2, 0.9) == 1
+
+
+def test_need_fn_per_card_on_mixed_pool():
+    # need_fn = util*g.total differs per card; a model "fits" the big card but not the small one.
+    big = GpuView("big", total=24000, used_smi=0)
+    small = GpuView("small", total=8000, used_smi=0)
+    need_fn = lambda g: 0.9 * g.total  # noqa: E731
+    chosen, ev = select_gpu([small, big], {"small": [], "big": []}, need_fn, NOW, 90)
+    assert chosen == "big" and ev == []   # 0.9*8000=7200 fits small too, but big is most-free
+    # A need that exceeds the small card's util budget only fits the big card.
+    need_big = lambda g: 20000  # noqa: E731
+    chosen2, _ = select_gpu([small, big], {"small": [], "big": []}, need_big, NOW, 90)
+    assert chosen2 == "big"
+
+
+def test_select_colocated_blocked_gpus():
+    # GPU "A" hosts a non-colocate model (blocked); "B" is free -> colocate lands on B.
+    a = GpuView("A", total=24000, used_smi=12000, ready_footprint=12000)
+    b = GpuView("B", total=24000, used_smi=0)
+    rbg = {"A": [R("wc", 12000, OLD, loaded_at=OLD, colocate=True)], "B": []}
+    # Even though A's resident is marked colocate here, blocked_gpus forces exclusion of A.
+    uuid, ev = select_colocated([a, b], rbg, lambda g: 8000, {"A"}, NOW, 90)
+    assert uuid == "B", (uuid, ev)
+    # If both are blocked -> None.
+    uuid2, _ = select_colocated([a, b], rbg, lambda g: 8000, {"A", "B"}, NOW, 90)
+    assert uuid2 is None
 
 
 if __name__ == "__main__":

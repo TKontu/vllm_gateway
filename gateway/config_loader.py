@@ -258,6 +258,30 @@ def validate_tp_against_pools(configs: "dict[str, ModelConfig]", pools: "dict[st
                 )
 
 
+def migrate_footprints(raw: dict) -> dict:
+    """Normalize the footprints file to the per-model record shape.
+
+    New shape: {repo: {"per_gpu_mib": float, "effective_tp": int, "measured_at": float}}.
+    Legacy shape was {repo: number} (a per-GPU footprint measured at tp=1; 0 = unmeasurable
+    sentinel). Migrate legacy scalar values forward (assume tp=1). Records already in the new
+    shape pass through. Unparseable entries are dropped.
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for repo, val in raw.items():
+        if isinstance(val, dict) and "per_gpu_mib" in val:
+            out[repo] = {
+                "per_gpu_mib": float(val.get("per_gpu_mib", 0.0)),
+                "effective_tp": int(val.get("effective_tp", 1) or 1),
+                "measured_at": float(val.get("measured_at", 0.0)),
+            }
+        elif isinstance(val, (int, float)) and not isinstance(val, bool):
+            out[repo] = {"per_gpu_mib": float(val), "effective_tp": 1, "measured_at": 0.0}
+        # anything else: drop (corrupt entry)
+    return out
+
+
 def validate_pools_visible(pools: "dict[str, list]", visible_uuids: "set") -> None:
     """Fail fast if any configured GPU UUID isn't visible to nvidia-smi.
 

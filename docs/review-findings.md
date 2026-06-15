@@ -20,12 +20,23 @@ Scope: `gateway/app.py`, `gateway/placement.py`, `gateway/config_loader.py`, `co
 - **F15** ✅ `save_known_footprints_async` runs the write off the event loop.
 - **F16** ✅ stale GPU-pin and "POOL-BASED (no TP/colocation)" comments corrected.
 
-**Stage 2 — PENDING** (all touch the placement decision block; done together to avoid double churn):
-- **F1, F3, F4, F7, F13** — the concurrency-core refactor (status state machine + single `state_lock`
-  + reconciler).
-- **F2, F9** — deterministic `effective_tp` + per-card `need_fn` + footprint re-key (wired into the
-  rewritten block).
-- **F5** — fold the `TOTAL_GPU_VRAM==0` bypass into the unified path.
+**Stage 2 — DONE** (branch `placement-hardening-stage2`; the concurrency-core refactor):
+- **F1** ✅ `queue_count_lock` now guards only the counter; placement/start/proxy run outside it.
+- **F3** ✅ reservation is the LOADING entry's `reserved_mib`; the entry is dropped in one place
+  (`_start_and_finalize`'s failure path) — no side-dict to leak.
+- **F4** ✅ slot + VRAM claimed atomically by inserting the LOADING entry under `state_lock`.
+- **F7** ✅ LOADING models are visible to placement; `select_colocated` takes `blocked_gpus`.
+- **F13** ✅ reconciler in the inactivity monitor reaps orphaned LOADING entries (self-healing).
+- **F2** ✅ `placement.compute_effective_tp` runs every request; footprints re-keyed to
+  `{per_gpu_mib, effective_tp, measured_at}` (legacy migrated) and the tp decision is persisted.
+- **F9** ✅ `select_*` take a per-card `need_fn(GpuView)`.
+- **F5** ✅ the `TOTAL_GPU_VRAM==0` path is folded into the unified flow (records an entry, honors
+  `gpu_uuids`).
+
+Architecture: `model_management_lock`+`placement_lock`→one `state_lock`; `gpu_reservations` deleted
+(reservation lives on the LOADING entry); `ContainerState` gains `status`/`reserved_mib`/
+`effective_tp`/`effective_util`/`created_at`; `start_model_container` returns `(ip, port)` and the
+caller owns the entry lifecycle (`_ensure_started` → `_reserve`/insert → `_start_and_finalize`).
 
 *(Sequencing note: the approved plan placed F2/F9/F5 in Stage 1, but they edit the same placement
 block that the Stage 2 rewrite replaces, so they were moved to Stage 2 to avoid editing it twice.

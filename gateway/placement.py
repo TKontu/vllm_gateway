@@ -76,46 +76,39 @@ def select_evictions(residents, needed, total_vram, current_usage, now, min_resi
     return best
 
 
-def select_gpu(candidates, residents_by_gpu, needed, now, min_resident_seconds):
-    """Choose a GPU in a pool for a model needing `needed` MiB (whole-card, no TP).
+def _need(need_fn, g):
+    """Per-GPU need: need_fn may be a callable(GpuView)->mib or a plain scalar (back-compat)."""
+    return need_fn(g) if callable(need_fn) else need_fn
+
+
+def select_gpu(candidates, residents_by_gpu, need_fn, now, min_resident_seconds):
+    """Choose a GPU in a pool for a model (whole-card, no TP).
 
     candidates       : list[GpuView] — the pool's GPUs.
     residents_by_gpu : {uuid: [resident, ...]} — gateway containers currently on each GPU.
+    need_fn          : callable(GpuView)->MiB (per-card need; e.g. util*g.total) or a scalar.
 
     Returns (chosen_uuid, eviction_container_names). chosen_uuid is None when no GPU can fit
     the model even after evicting every idle/non-always_on model (remaining VRAM is held by
     always_on or in-flight models, or external processes) — the caller should reject (503)
     rather than over-commit and risk an OOM.
 
-    1. Direct fit: among GPUs with free >= needed, pick the MOST free (spreads load).
-    2. Otherwise, for each GPU compute a guarded LRU eviction set (select_evictions, scoped to
-       that GPU) and accept it only if it actually frees enough. Choose the GPU needing the
-       fewest evictions, tie-broken by most resulting free space.
+    1. Direct fit: among GPUs with free >= need, pick the MOST free (spreads load).
+    2. Otherwise guarded per-GPU LRU eviction (accept only GPUs that genuinely fit); choose the
+       GPU needing the fewest evictions, tie-broken by most resulting free space.
     """
     # 1. Direct fit, most-free first.
-    direct = [g for g in candidates if g.free >= needed]
+    direct = [g for g in candidates if g.free >= _need(need_fn, g)]
     if direct:
-        best = max(direct, key=lambda g: g.free)
-        return best.uuid, []
+        return max(direct, key=lambda g: g.free).uuid, []
 
     # 2. Eviction required — evaluate each GPU.
     options = []  # (num_evictions, -resulting_free, uuid, eviction_names)
     for g in candidates:
-        residents = residents_by_gpu.get(g.uuid, [])
-        used_eff = g.total - g.free  # effective used (smi/floor + reservation)
-        evictions = select_evictions(
-            residents=residents,
-            needed=needed,
-            total_vram=g.total,
-            current_usage=used_eff,
-            now=now,
-            min_resident_seconds=min_resident_seconds,
-        )
-        footprint = {r.container_name: r.vram_footprint for r in residents}
-        freed = sum(footprint.get(n, 0.0) for n in evictions)
-        if g.free + freed >= needed:  # only accept GPUs that genuinely fit after eviction
-            resulting_free = g.free + freed
-            options.append((len(evictions), -resulting_free, g.uuid, evictions))
+        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), _need(need_fn, g), now, min_resident_seconds)
+        if cost is not None:
+            num_ev, resulting_free, ev = cost
+            options.append((num_ev, -resulting_free, g.uuid, ev))
 
     if not options:
         return None, []
@@ -170,18 +163,38 @@ def _gpu_fit_cost(g, residents, needed, now, min_resident_seconds):
     return None
 
 
-def select_placement(candidates, residents_by_gpu, needed_per_gpu, tp, now, min_resident_seconds):
+def compute_effective_tp(weight_bytes, configured_tp, prior_tp, pool_totals, util, overhead=1.2):
+    """Deterministic tensor-parallel degree for a model — computed every request (not gated on
+    discovery), so the decision never reverts between requests (fixes F2).
+
+    Precedence: forced config tp (>1) → a persisted prior tp (>1) → minimal TP to fit the weights
+    on a HOMOGENEOUS, multi-GPU pool → 1. `pool_totals` is the list of per-GPU totals (MiB) for the
+    model's pool. `weight_bytes` may be None (unknown) → no auto-split.
+    """
+    if configured_tp and configured_tp > 1:
+        return configured_tp
+    if prior_tp and prior_tp > 1:
+        return prior_tp
+    if len(pool_totals) >= 2 and max(pool_totals) > 0 and \
+            (max(pool_totals) - min(pool_totals)) <= 0.05 * max(pool_totals):
+        return minimal_tp_to_fit(weight_bytes, max(pool_totals), util,
+                                 overhead=overhead, pool_size=len(pool_totals))
+    return 1
+
+
+def select_placement(candidates, residents_by_gpu, need_fn, tp, now, min_resident_seconds):
     """Choose GPU(s) for a model. Returns (chosen_uuids: list | None, eviction_names: list).
 
+    need_fn : callable(GpuView)->MiB (per-card need) or a scalar.
     tp == 1 : single-GPU placement (delegates to select_gpu — identical to Phase 1b).
-    tp >= 2 : tensor-parallel across exactly `tp` GPUs of a HOMOGENEOUS pool. Each chosen GPU
-              must host `needed_per_gpu` (vLLM applies gpu_memory_utilization to every card, so
-              the per-card need does NOT shrink with tp). Picks the `tp` GPUs needing the fewest
-              evictions (tie-break: most resulting free), evicting guarded-LRU per GPU. Returns
-              None if the pool is heterogeneous, has fewer than `tp` GPUs, or `tp` GPUs can't fit.
+    tp >= 2 : tensor-parallel across exactly `tp` GPUs of a HOMOGENEOUS pool. Each chosen GPU must
+              host need_fn(g) (vLLM applies gpu_memory_utilization to every card, so the per-card
+              need does NOT shrink with tp). Picks the `tp` GPUs needing the fewest evictions
+              (tie-break: most resulting free). None if the pool is heterogeneous, has fewer than
+              `tp` GPUs, or `tp` GPUs can't fit.
     """
     if tp <= 1:
-        uuid, evictions = select_gpu(candidates, residents_by_gpu, needed_per_gpu, now, min_resident_seconds)
+        uuid, evictions = select_gpu(candidates, residents_by_gpu, need_fn, now, min_resident_seconds)
         return ([uuid], evictions) if uuid is not None else (None, [])
 
     if not _homogeneous(candidates) or len(candidates) < tp:
@@ -189,7 +202,7 @@ def select_placement(candidates, residents_by_gpu, needed_per_gpu, tp, now, min_
 
     options = []  # (num_evictions, -resulting_free, uuid, eviction_names)
     for g in candidates:
-        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), needed_per_gpu, now, min_resident_seconds)
+        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), _need(need_fn, g), now, min_resident_seconds)
         if cost is not None:
             num_ev, resulting_free, ev = cost
             options.append((num_ev, -resulting_free, g.uuid, ev))
@@ -204,31 +217,32 @@ def select_placement(candidates, residents_by_gpu, needed_per_gpu, tp, now, min_
     return chosen_uuids, evictions
 
 
-def select_colocated(candidates, residents_by_gpu, needed, now, min_resident_seconds):
+def select_colocated(candidates, residents_by_gpu, need_fn, blocked_gpus, now, min_resident_seconds):
     """Choose a GPU for a co-locatable model that may SHARE a card with other co-locatable models.
 
     Returns (chosen_uuid | None, eviction_names). Single GPU.
 
-    A GPU is eligible only if it is empty or every resident on it is itself co-locatable
-    (a co-locatable model never shares with a whole-card model). Among eligible GPUs: direct fit
-    (free >= needed) most-free first; else evict idle co-residents guarded-LRU *only as much as
-    needed* (reuse _gpu_fit_cost — it stops once `needed` fits, so co-residents are kept when
-    possible); else None (caller 503s).
+    A GPU is eligible only if it is NOT in `blocked_gpus` (GPUs hosting a non-colocate LOADING or
+    READY model — closes F7) and every resident on it is itself co-locatable. Among eligible GPUs:
+    direct fit (free >= need_fn(g)) most-free first; else evict idle co-residents guarded-LRU only
+    as much as needed; else None (caller 503s).
     """
+    blocked = blocked_gpus or set()
     eligible = [
         g for g in candidates
-        if all(getattr(r, "colocate", False) for r in residents_by_gpu.get(g.uuid, []))
+        if g.uuid not in blocked
+        and all(getattr(r, "colocate", False) for r in residents_by_gpu.get(g.uuid, []))
     ]
 
     # 1. Direct fit, most-free first.
-    direct = [g for g in eligible if g.free >= needed]
+    direct = [g for g in eligible if g.free >= _need(need_fn, g)]
     if direct:
         return max(direct, key=lambda g: g.free).uuid, []
 
     # 2. Partial guarded eviction of idle co-residents.
     options = []  # (num_evictions, -resulting_free, uuid, eviction_names)
     for g in eligible:
-        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), needed, now, min_resident_seconds)
+        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), _need(need_fn, g), now, min_resident_seconds)
         if cost is not None:
             num_ev, resulting_free, ev = cost
             options.append((num_ev, -resulting_free, g.uuid, ev))
