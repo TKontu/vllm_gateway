@@ -5,6 +5,7 @@ daemon (importing app.py triggers docker.from_env()). Functions operate on any o
 exposing the ContainerState attributes used below (duck-typed).
 """
 
+import math
 from dataclasses import dataclass
 
 
@@ -121,3 +122,83 @@ def select_gpu(candidates, residents_by_gpu, needed, now, min_resident_seconds):
     options.sort()
     _, _, uuid, evictions = options[0]
     return uuid, evictions
+
+
+def _homogeneous(candidates, tol=0.05) -> bool:
+    """True iff all candidate GPUs have ~equal total VRAM (within `tol` of the largest).
+
+    Tensor-parallel requires equal-VRAM cards; this decisively rejects a mixed pool
+    (e.g. a 24 GB 3090 + a 6 GB A2000) while tolerating minor driver/ECC reporting drift."""
+    totals = [c.total for c in candidates]
+    if not totals:
+        return False
+    hi = max(totals)
+    return hi > 0 and (hi - min(totals)) <= tol * hi
+
+
+def minimal_tp_to_fit(weight_bytes, card_total_mib, util, overhead=1.2, pool_size=None) -> int:
+    """Minimal tensor-parallel degree so a model's weights fit across homogeneous cards.
+
+    weight_bytes : estimated total model weight size in bytes (None/0 -> 1, i.e. no split).
+    Per card, vLLM can use ~util*card_total_mib; `overhead` (~1.2) allows for activations /
+    CUDA context / fragmentation on top of raw weights. Result is capped at pool_size."""
+    if not weight_bytes or weight_bytes <= 0:
+        return 1
+    usable_per_card = util * card_total_mib
+    if usable_per_card <= 0:
+        return 1
+    weight_mib = (weight_bytes / (1024.0 * 1024.0)) * overhead
+    tp = max(1, math.ceil(weight_mib / usable_per_card))
+    if pool_size is not None:
+        tp = min(tp, pool_size)
+    return tp
+
+
+def _gpu_fit_cost(g, residents, needed, now, min_resident_seconds):
+    """Can GPU `g` host `needed` MiB? Returns (num_evictions, resulting_free, eviction_names)
+    if it can (directly or after guarded eviction), else None."""
+    if g.free >= needed:
+        return (0, g.free, [])
+    evictions = select_evictions(
+        residents=residents, needed=needed, total_vram=g.total,
+        current_usage=g.total - g.free, now=now, min_resident_seconds=min_resident_seconds,
+    )
+    footprint = {r.container_name: r.vram_footprint for r in residents}
+    freed = sum(footprint.get(n, 0.0) for n in evictions)
+    if g.free + freed >= needed:
+        return (len(evictions), g.free + freed, evictions)
+    return None
+
+
+def select_placement(candidates, residents_by_gpu, needed_per_gpu, tp, now, min_resident_seconds):
+    """Choose GPU(s) for a model. Returns (chosen_uuids: list | None, eviction_names: list).
+
+    tp == 1 : single-GPU placement (delegates to select_gpu — identical to Phase 1b).
+    tp >= 2 : tensor-parallel across exactly `tp` GPUs of a HOMOGENEOUS pool. Each chosen GPU
+              must host `needed_per_gpu` (vLLM applies gpu_memory_utilization to every card, so
+              the per-card need does NOT shrink with tp). Picks the `tp` GPUs needing the fewest
+              evictions (tie-break: most resulting free), evicting guarded-LRU per GPU. Returns
+              None if the pool is heterogeneous, has fewer than `tp` GPUs, or `tp` GPUs can't fit.
+    """
+    if tp <= 1:
+        uuid, evictions = select_gpu(candidates, residents_by_gpu, needed_per_gpu, now, min_resident_seconds)
+        return ([uuid], evictions) if uuid is not None else (None, [])
+
+    if not _homogeneous(candidates) or len(candidates) < tp:
+        return None, []
+
+    options = []  # (num_evictions, -resulting_free, uuid, eviction_names)
+    for g in candidates:
+        cost = _gpu_fit_cost(g, residents_by_gpu.get(g.uuid, []), needed_per_gpu, now, min_resident_seconds)
+        if cost is not None:
+            num_ev, resulting_free, ev = cost
+            options.append((num_ev, -resulting_free, g.uuid, ev))
+
+    if len(options) < tp:
+        return None, []
+    options.sort()
+    chosen = options[:tp]
+    chosen_uuids = [o[2] for o in chosen]
+    # Dedupe eviction names (a multi-GPU/TP resident can appear on several chosen GPUs).
+    evictions = list(dict.fromkeys(n for o in chosen for n in o[3]))
+    return chosen_uuids, evictions

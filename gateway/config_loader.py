@@ -215,12 +215,37 @@ def validate_model_pools(configs: "dict[str, ModelConfig]", pools: "dict[str, li
 
     When ``pools`` is empty (no multi-GPU topology), a stray per-model ``pool`` is meaningless
     and ignored by the caller; we don't raise so adding ``pool:`` can't break the fallback path.
+    When ``pools`` is declared, every model must name one (an explicit ``pool`` or a
+    ``defaults.pool``) — a pool-less model would otherwise have no GPUs to place onto.
     """
     if not pools:
         return
     declared = set(pools)
     for name, cfg in configs.items():
-        if cfg.pool is not None and cfg.pool not in declared:
+        if cfg.pool is None:
+            raise ValueError(
+                f"model '{name}': no pool set, but pools are declared. Set 'pool' on the model "
+                f"or a 'defaults.pool'; declared pools: {sorted(declared)}"
+            )
+        if cfg.pool not in declared:
             raise ValueError(
                 f"model '{name}': pool '{cfg.pool}' is not a declared pool; declared: {sorted(declared)}"
             )
+
+
+def validate_tp_against_pools(configs: "dict[str, ModelConfig]", pools: "dict[str, list]") -> None:
+    """Fail fast when a model's tensor_parallel_size exceeds the GPUs declared in its pool.
+
+    Only meaningful when ``pools`` is declared (the GPU count per pool is then known at load
+    time). Homogeneity (equal VRAM) can only be checked at runtime; placement enforces that.
+    """
+    if not pools:
+        return
+    for name, cfg in configs.items():
+        if cfg.tensor_parallel_size > 1 and cfg.pool in pools:
+            available = len(pools[cfg.pool])
+            if cfg.tensor_parallel_size > available:
+                raise ValueError(
+                    f"model '{name}': tensor_parallel_size={cfg.tensor_parallel_size} exceeds the "
+                    f"{available} GPU(s) declared in pool '{cfg.pool}'"
+                )
