@@ -5,5 +5,9 @@ my-vlmm-gateway.tar
 *.mdb
 data/
 memory_footprints.json
+__pycache__/
+*.pyc
+# Local per-model config (keep the .example in git, ignore the real one)
+config/models.yaml
 cheatsheet*
 .venv/

@@ -98,6 +98,62 @@ To build the `my-vllm-gateway:latest` image, navigate to the `gateway` directory
 docker build -t my-vllm-gateway:latest .
 ```
 
+## Model Configuration File
+
+Models and their per-model vLLM tuning live in a mounted YAML file. Its path comes from
+`MODELS_CONFIG_FILE` (default `/app/config/models.yaml`); the compose file mounts
+`./config` read-only at `/app/config`. Copy the example and edit it:
+
+```bash
+cp config/models.yaml.example config/models.yaml
+```
+
+```yaml
+defaults:                      # optional; applies to all models
+  gpu_memory_utilization: 0.90
+  max_model_len: 0             # 0 = use the model's native max (omit the flag)
+  tensor_parallel_size: 1
+  quantization: null           # awq | gptq | fp8 | null
+  dtype: auto
+  inactivity_timeout: 1800     # seconds; 0 = never unload
+  always_on: false
+  extra_args: []               # raw vLLM CLI args, appended verbatim
+models:                        # required, non-empty
+  gemma3-4B:
+    repo: google/gemma-3-4b-it
+  qwen3-30b-awq:
+    repo: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+    quantization: awq          # per-model override
+  bge-m3:
+    repo: BAAI/bge-m3
+    always_on: true            # never auto-unloaded
+    inactivity_timeout: 0
+```
+
+**Precedence (per setting):** `per-model entry` → `defaults` block → **built-in default**
+(the corresponding `VLLM_*` env var). So an unset field falls back to the `defaults` block,
+and if that's unset too, to the legacy global env var.
+
+**Per-model command construction.** Each container's vLLM command is built from its resolved
+config: always `--model`, `--gpu-memory-utilization`, `--tensor-parallel-size`; plus
+`--max-model-len` (only when `max_model_len > 0`, capped to the model's native max),
+`--quantization` (only when not null), `--dtype` (only when not `auto`); then each `extra_args`
+string is appended verbatim. `extra_args` override any flag the gateway generated (no
+duplicates). The final command is logged per model.
+
+**Lifecycle.** Containers whose model sets `always_on: true` (or `inactivity_timeout: 0`) are
+never auto-unloaded by the inactivity monitor; all others use their own resolved
+`inactivity_timeout`.
+
+**Validation / fail-fast.** The file is validated at startup — `models` must be present and
+non-empty, every model needs a non-empty `repo`, unknown keys are rejected, and types/ranges
+are checked (`0 < gpu_memory_utilization <= 1`, integer fields must be integers, `extra_args`
+must be a list). Any error is logged and the gateway refuses to start.
+
+**Backward compatibility.** If `MODELS_CONFIG_FILE` is missing, the gateway falls back to the
+legacy `ALLOWED_MODELS_JSON` env var with the global `VLLM_*` settings — behaving exactly as
+before this feature existed.
+
 ## Configuration
 
 All configuration is done via environment variables, making it easy to deploy with Portainer, Kubernetes, or directly from GitHub.
