@@ -258,6 +258,27 @@ def validate_tp_against_pools(configs: "dict[str, ModelConfig]", pools: "dict[st
                 )
 
 
+def validate_pools_visible(pools: "dict[str, list]", visible_uuids: "set") -> None:
+    """Fail fast if any configured GPU UUID isn't visible to nvidia-smi.
+
+    Runs at startup AFTER the GPU probe (the visible set is a runtime fact). Catches the common
+    typo in a long `GPU-xxxx...` UUID, instead of silently treating that GPU as having 0 VRAM
+    (which would make its pool unplaceable with only a log warning).
+    """
+    if not pools:
+        return
+    missing = []
+    for pool_name, uuids in pools.items():
+        for u in uuids:
+            if u not in visible_uuids:
+                missing.append(f"{u} (pool '{pool_name}')")
+    if missing:
+        raise ValueError(
+            "Configured GPU UUID(s) not visible to nvidia-smi: " + "; ".join(missing) +
+            f". Visible: {sorted(visible_uuids)}. Check pools/GATEWAY_GPU_UUID against `nvidia-smi -L`."
+        )
+
+
 def validate_colocate(configs: "dict[str, ModelConfig]", max_share: float = 0.9) -> None:
     """Validate co-location settings. Raises on a hard conflict; warns on a soft smell.
 
