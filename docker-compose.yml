@@ -35,6 +35,14 @@ services:
       GATEWAY_CONTAINER_NAME: ${GATEWAY_CONTAINER_NAME:-vllm_gateway}
       VLLM_CONTAINER_PREFIX: ${VLLM_CONTAINER_PREFIX:-vllm_server}
 
+      # --- WORKER CUDA / DRIVER ---
+      # Optional LD_LIBRARY_PATH applied to every vLLM worker container. Leave blank normally.
+      # Set it when the host NVIDIA driver is NEWER than the vLLM image's bundled cuda-compat lib
+      # (symptom: workers crash at startup with CUDA error 803 / "unsupported display driver / cuda
+      # driver combination"). Point it at the host driver libs the NVIDIA Container Toolkit mounts:
+      #   WORKER_LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+      WORKER_LD_LIBRARY_PATH: ${WORKER_LD_LIBRARY_PATH:-}
+
       # --- PATHS (HOST) ---
       HOST_CACHE_DIR: ${HOST_CACHE_DIR:-/root/.cache/huggingface}
       HOST_TEMP_DIR: ${HOST_TEMP_DIR:-/tmp}
