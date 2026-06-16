@@ -45,8 +45,11 @@ services:
       # Mount a directory for data persistence (app will create files inside)
       - ${HOST_DATA_DIR:-./data}:/app/data
       - ${HOST_TEMP_DIR:-/tmp}:${VLLM_TEMP_DIR:-/tmp}
-      # Per-model configuration (read-only). Copy config/models.yaml.example -> config/models.yaml
-      - ./config:/app/config:ro
+      # Per-model configuration (read-only), mounted at /app/config (MODELS_CONFIG_FILE points here).
+      # Set HOST_CONFIG_DIR to an absolute host dir (e.g. /models/vllm-gateway/config) that contains
+      # your models.yaml — so the config can live on the host and be configured purely via env (no
+      # compose edit needed). Defaults to ./config in the stack dir for local/dev use.
+      - ${HOST_CONFIG_DIR:-./config}:/app/config:ro
 
     networks:
       - vllm_network
