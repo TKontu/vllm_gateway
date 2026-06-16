@@ -74,6 +74,11 @@ GATEWAY_MIN_RESIDENT_SECONDS = int(os.getenv("GATEWAY_MIN_RESIDENT_SECONDS", "90
 # budget (~1h) so a genuinely slow cold start is never reaped mid-flight.
 GATEWAY_LOADING_TIMEOUT = int(os.getenv("GATEWAY_LOADING_TIMEOUT", "3900"))
 
+# A READY container whose active_requests has been > 0 while idle for longer than
+# GATEWAY_REQUEST_STALE_FACTOR x GATEWAY_REQUEST_TIMEOUT is assumed to have a leaked in-flight count
+# (e.g. an undriven streaming generator) and is clamped to 0 by the reconciler so it can be evicted.
+GATEWAY_REQUEST_STALE_FACTOR = int(os.getenv("GATEWAY_REQUEST_STALE_FACTOR", "2"))
+
 # Co-location (Phase 3): when a co-locatable model shares a card, its launch util is capped so it
 # leaves COLOCATE_MARGIN_MIB free; weights must fit util*total * COLOCATE_WEIGHT_OVERHEAD; a
 # colocate model whose share exceeds COLOCATE_MAX_SHARE is warned about at startup.
@@ -141,6 +146,11 @@ active_containers = {}  # container_name -> ContainerState (entries exist while 
 state_lock = asyncio.Lock()
 container_start_locks = {}  # model_id -> asyncio.Lock for preventing concurrent container starts
 download_locks = {}  # model_id -> asyncio.Lock for preventing concurrent downloads
+# container_name -> the asyncio.Task currently starting that LOADING entry. The reconciler reaps a
+# LOADING entry only when its owner task is absent/done (a true orphan), never on a timer — so a
+# legitimately slow start (large download) is never killed. Kept off ContainerState so /status stays
+# JSON-clean.
+loading_tasks = {}
 
 # Multi-GPU placement state (resolved at startup; see resolve_managed_pools)
 MANAGED_POOLS = {}  # pool_name -> [gpu_uuid, ...]: the GPUs this gateway manages, grouped into pools
@@ -162,7 +172,9 @@ class ContainerState:
     container_name: str
     status: "ContainerStatus"
     gpu_uuids: list                 # GPU UUID(s) this container is pinned to (set at LOADING)
-    reserved_mib: float             # optimistic VRAM claim while LOADING (the reservation; one source of truth)
+    reserved_mib: float             # VRAM reservation while LOADING (counted via GpuView.reserved). Once
+                                    # READY, accounting uses vram_footprint instead; reserved_mib is retained
+                                    # only as the seed/estimate and is not re-read.
     effective_tp: int = 1           # tensor-parallel degree actually launched
     effective_util: float = 0.0     # gpu-memory-utilization actually launched (0 => model default)
     colocate: bool = False          # may share its GPU with other co-locatable models (Phase 3)
@@ -622,14 +634,23 @@ ALLOWED_MODELS = {name: cfg.repo for name, cfg in MODEL_CONFIGS.items()}
 # --- Background Tasks ---
 
 async def shutdown_inactive_containers():
-    """Background monitor: unload idle READY containers AND reconcile orphaned state.
+    """Background monitor + reconciler.
 
     Inactivity: each READY container uses its own resolved inactivity_timeout; always_on (or
-    timeout 0) is never unloaded. Reconciliation: a LOADING entry older than
-    GATEWAY_LOADING_TIMEOUT is an orphan (its start crashed without cleanup) and is dropped so its
-    reserved VRAM is reclaimed — this is what makes reservation/slot leaks self-healing.
+    timeout 0) is never unloaded.
+
+    Reconciliation (self-healing):
+      - A LOADING entry whose owning start task is absent/done (a true orphan — the start coroutine
+        died without running its cleanup) is dropped, reclaiming its reservation/slot. We use owner
+        liveness, NOT elapsed time, so a legitimately slow start (large download) is never killed
+        (G2). GATEWAY_LOADING_TIMEOUT is only a generous last-resort ceiling.
+      - A READY container with a leaked active_requests>0 whose last_request_time is stale (older
+        than GATEWAY_REQUEST_STALE_FACTOR x GATEWAY_REQUEST_TIMEOUT) is clamped to 0 so it can be
+        evicted again — best-effort backstop for an undriven streaming generator (G7). The
+        generator's finally remains the primary decrement.
     """
-    logging.info("Starting inactivity monitor + reconciler (per-model timeouts; always_on never unloaded).")
+    logging.info("Starting inactivity monitor + reconciler (owner-liveness reaping; always_on never unloaded).")
+    stale_after = GATEWAY_REQUEST_STALE_FACTOR * GATEWAY_REQUEST_TIMEOUT
     while True:
         try:
             await asyncio.sleep(60)
@@ -639,20 +660,29 @@ async def shutdown_inactive_containers():
             async with state_lock:
                 for name, state in active_containers.items():
                     if state.status == ContainerStatus.LOADING:
-                        if now - state.created_at > GATEWAY_LOADING_TIMEOUT:
+                        task = loading_tasks.get(name)
+                        # Orphan iff no live owner. Belt-and-suspenders: also reap if it has somehow
+                        # outlived the absolute ceiling.
+                        if (task is None or task.done()) or (now - state.created_at > GATEWAY_LOADING_TIMEOUT):
                             orphans.append(name)
                         continue
                     if state.status != ContainerStatus.READY:
                         continue  # STOPPING is owned by stop_container
+                    # G7: self-heal a leaked in-flight count on an otherwise-idle container.
+                    if state.active_requests > 0 and (now - state.last_request_time) > stale_after:
+                        logging.warning(f"Clamping stale active_requests={state.active_requests} on {name} "
+                                        f"(idle {int(now - state.last_request_time)}s) -> 0.")
+                        state.active_requests = 0
                     if state.always_on or state.inactivity_timeout <= 0:
                         continue
                     if now - state.last_request_time > state.inactivity_timeout:
                         inactive_containers.append(name)
                 # Reap orphaned LOADING entries in-place (no container to stop — start never finished).
                 for name in orphans:
-                    logging.warning(f"Reaping orphaned LOADING entry {name} "
-                                    f"(age > {GATEWAY_LOADING_TIMEOUT}s); reclaiming its reservation.")
+                    logging.warning(f"Reaping orphaned LOADING entry {name} (owner task absent/done); "
+                                    f"reclaiming its reservation.")
                     active_containers.pop(name, None)
+                    loading_tasks.pop(name, None)
 
             # Stop idle containers outside the lock (I/O).
             for name in inactive_containers:
@@ -666,10 +696,13 @@ async def stop_container(container_name: str, drain_timeout: float = 30.0):
     """Gracefully stop+remove a container: flip STOPPING (off routing + fit math), drain in-flight,
     docker stop/remove, then drop the entry. The entry stays present (STOPPING) during the drain so
     no new request routes to it and its VRAM isn't double-freed in accounting (still in used_smi)."""
-    # Step 1: mark STOPPING (keep the entry; it's excluded from routing and fit math while stopping).
+    # Step 1: claim the teardown. If the entry is already STOPPING, another caller owns it -> return
+    # (idempotent; avoids a double docker stop/remove and double drain). G8.
     async with state_lock:
         state = active_containers.get(container_name)
         if state is not None:
+            if state.status == ContainerStatus.STOPPING:
+                return  # already being torn down by another caller
             state.status = ContainerStatus.STOPPING
 
     # Step 2: wait for in-flight requests to finish before killing the container.
@@ -1110,29 +1143,53 @@ async def gateway_status():
 
 # --- Placement helpers (the LOADING/READY/STOPPING lifecycle) ---
 
+async def _release_active(container):
+    """Decrement a container's in-flight count under state_lock (single guarded owner of the count)."""
+    async with state_lock:
+        if container.active_requests > 0:
+            container.active_requests -= 1
+
+async def _settled_used(uuid: str, poll: float = 2.0, max_polls: int = 5) -> float:
+    """Return a GPU's `used` MiB after it has settled — poll until it stops dropping (freed VRAM from
+    a just-evicted container is released asynchronously) or `max_polls` elapse. Used as the discovery
+    baseline so an eviction's not-yet-released VRAM doesn't understate the measured footprint (G4)."""
+    last = (await get_gpu_vram()).get(uuid, {}).get("used", 0.0)
+    for _ in range(max_polls):
+        await asyncio.sleep(poll)
+        cur = (await get_gpu_vram()).get(uuid, {}).get("used", 0.0)
+        if cur >= last - 64:  # stopped dropping (within noise)
+            return cur
+        last = cur
+    return last
+
 def _build_gpu_views(pool_gpus, gpus_snapshot):
     """Build (candidates, residents_by_gpu, blocked_gpus) for placement. MUST be called under
-    state_lock (reads active_containers). READY entries are eviction candidates + ready_footprint;
-    LOADING entries fold into GpuView.reserved; STOPPING entries are excluded from both. A GPU with
-    any non-colocate LOADING/READY occupant is 'blocked' for co-location (closes F7)."""
+    state_lock (reads active_containers).
+
+    Accounting is conservative: a STOPPING model's VRAM is still resident until its container is
+    actually removed, so STOPPING counts toward ready_footprint and blocks co-location just like
+    READY (G6) — it just isn't an eviction candidate (it's already leaving). LOADING folds into
+    GpuView.reserved. A GPU with any non-colocate LOADING/READY/STOPPING occupant is 'blocked'
+    for co-location (a colocate model never shares with a whole-card model)."""
     candidates = []
     residents_by_gpu = {}
     blocked = set()
     for guid in pool_gpus:
         g = gpus_snapshot.get(guid)
-        on_gpu = [c for c in active_containers.values()
-                  if guid in c.gpu_uuids and c.status != ContainerStatus.STOPPING]
+        on_gpu = [c for c in active_containers.values() if guid in c.gpu_uuids]
         ready = [c for c in on_gpu if c.status == ContainerStatus.READY]
         loading = [c for c in on_gpu if c.status == ContainerStatus.LOADING]
+        stopping = [c for c in on_gpu if c.status == ContainerStatus.STOPPING]
         residents_by_gpu[guid] = ready  # eviction candidates are READY only
         candidates.append(placement.GpuView(
             uuid=guid,
             total=float(g["total"]) if g else 0.0,
             used_smi=float(g["used"]) if g else 0.0,
             reserved=sum(c.reserved_mib for c in loading),
-            ready_footprint=sum(c.vram_footprint for c in ready),
+            # READY + STOPPING footprints both still occupy the card.
+            ready_footprint=sum(c.vram_footprint for c in (ready + stopping)),
         ))
-        if any(not c.colocate for c in on_gpu):
+        if any(not c.colocate for c in on_gpu):  # incl. STOPPING — its VRAM is still resident
             blocked.add(guid)
     return candidates, residents_by_gpu, blocked
 
@@ -1141,47 +1198,70 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
     """Start the container for an already-inserted LOADING `entry`, then flip it READY (or drop it
     on failure — the single cleanup site). Whole-card discovery refines the footprint after READY."""
     try:
-        runtime = await start_model_container(
-            target_model_id, entry.container_name, model_cfg,
-            gpu_uuids=gpu_uuids, effective_tp=effective_tp, effective_util=effective_util)
-    except BaseException:
-        async with state_lock:
-            active_containers.pop(entry.container_name, None)  # drop LOADING on any failure/cancel
-        raise
-    if not runtime:
-        async with state_lock:
-            active_containers.pop(entry.container_name, None)
-        return None
+        try:
+            runtime = await start_model_container(
+                target_model_id, entry.container_name, model_cfg,
+                gpu_uuids=gpu_uuids, effective_tp=effective_tp, effective_util=effective_util)
+        except BaseException:
+            async with state_lock:
+                active_containers.pop(entry.container_name, None)  # drop LOADING on any failure/cancel
+            raise
+        if not runtime:
+            async with state_lock:
+                active_containers.pop(entry.container_name, None)
+            return None
 
-    ip_address, port = runtime
-    async with state_lock:
-        entry.ip_address = ip_address
-        entry.port = port
-        entry.status = ContainerStatus.READY
-        entry.loaded_at = time.time()
-        entry.last_request_time = time.time()
-        # vram_footprint already seeded with reserved_mib at insert; discovery refines it below.
-        entry.vram_footprint = entry.reserved_mib
+        ip_address, port = runtime
+        # G1: the container is up. Re-check the LOADING entry is still OURS (the reconciler or an
+        # eviction could have removed it during the start). If it's gone, do NOT resurrect it as a
+        # forgotten zombie — stop the container we just started and report failure.
+        async with state_lock:
+            if active_containers.get(entry.container_name) is not entry:
+                stale = True
+            else:
+                stale = False
+                entry.ip_address = ip_address
+                entry.port = port
+                entry.status = ContainerStatus.READY
+                entry.loaded_at = time.time()
+                entry.last_request_time = time.time()
+                entry.vram_footprint = entry.reserved_mib  # seeded estimate; discovery may refine
+        if stale:
+            logging.warning(f"LOADING entry {entry.container_name} disappeared during start "
+                            f"(reaped/evicted); stopping the orphaned container.")
+            try:
+                c = await run_in_executor(docker_client.containers.get, entry.container_name)
+                await run_in_executor(c.stop)
+                await run_in_executor(c.remove)
+            except (NotFound, APIError) as e:
+                logging.error(f"Could not clean up orphaned container {entry.container_name}: {e}")
+            return None
 
-    # Whole-card discovery: measure the per-GPU footprint on one chosen GPU and persist it.
-    if run_discovery and meas_gpu:
-        logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
-        samples = []
-        for _ in range(3):
-            await asyncio.sleep(15)
-            samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
-        measured = max(samples) - before_used
-        if measured > 256:
-            logging.info(f"Measured per-GPU footprint for {target_model_id} on {meas_gpu}: {measured} MiB")
-            entry.vram_footprint = measured
-            known_footprints[target_model_id] = {
-                "per_gpu_mib": float(measured), "effective_tp": effective_tp, "measured_at": time.time()}
-        else:
-            logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); keeping estimate.")
-            known_footprints[target_model_id] = {
-                "per_gpu_mib": 0.0, "effective_tp": effective_tp, "measured_at": time.time()}  # sentinel
-        await save_known_footprints_async()
-    return entry
+        # Whole-card discovery: measure the per-GPU footprint on one chosen GPU and persist it.
+        if run_discovery and meas_gpu:
+            logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
+            samples = []
+            for _ in range(3):
+                await asyncio.sleep(15)
+                samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
+            measured = max(samples) - before_used
+            if measured > 256:
+                logging.info(f"Measured per-GPU footprint for {target_model_id} on {meas_gpu}: {measured} MiB")
+                entry.vram_footprint = measured
+                known_footprints[target_model_id] = {
+                    "per_gpu_mib": float(measured), "effective_tp": effective_tp, "measured_at": time.time()}
+            else:
+                # G5: unmeasurable -> persist the util*card ESTIMATE (the reservation we used), never a
+                # 0 sentinel. The model is "seen" with a sane footprint and won't re-run discovery.
+                logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); "
+                                f"persisting estimate {int(entry.reserved_mib)} MiB.")
+                entry.vram_footprint = entry.reserved_mib
+                known_footprints[target_model_id] = {
+                    "per_gpu_mib": float(entry.reserved_mib), "effective_tp": effective_tp, "measured_at": time.time()}
+            await save_known_footprints_async()
+        return entry
+    finally:
+        loading_tasks.pop(entry.container_name, None)  # release owner-liveness handle on every exit
 
 async def _ensure_started(target_model_id, model_cfg):
     """Ensure a READY container exists for the model and return it (or None on failure).
@@ -1223,6 +1303,7 @@ async def _ensure_started(target_model_id, model_cfg):
                 always_on=model_cfg.always_on, inactivity_timeout=model_cfg.inactivity_timeout,
                 created_at=time.time())
             active_containers[entry.container_name] = entry
+            loading_tasks[entry.container_name] = asyncio.current_task()  # owner-liveness handle (G2)
         return await _start_and_finalize(
             entry, target_model_id, model_cfg, gpu_uuids=gpu_uuids or None,
             effective_tp=model_cfg.tensor_parallel_size, effective_util=None,
@@ -1301,6 +1382,7 @@ async def _ensure_started(target_model_id, model_cfg):
             always_on=model_cfg.always_on, inactivity_timeout=model_cfg.inactivity_timeout,
             created_at=time.time())
         active_containers[entry.container_name] = entry
+        loading_tasks[entry.container_name] = asyncio.current_task()  # owner-liveness handle (G2)
         logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', "
                      f"{'colocate util=%.3f' % effective_util if is_colocate else 'tp=%d' % effective_tp}, "
                      f"~{int(reserve_amt)} MiB/GPU); evicting {evictions or 'nothing'}; slot {entry.container_name}.")
@@ -1309,7 +1391,13 @@ async def _ensure_started(target_model_id, model_cfg):
     for name in evictions:
         await stop_container(name)
     run_discovery = is_discovery and not is_colocate
-    before_used = gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0) if run_discovery else 0.0
+    # G4: take the discovery baseline AFTER evictions have actually released VRAM (stop_container
+    # returns before the driver frees it), not from the pre-decision snapshot. Settle by polling the
+    # chosen GPU's used until it stops dropping (or a short ceiling).
+    before_used = 0.0
+    if run_discovery:
+        before_used = await _settled_used(chosen_uuids[0]) if evictions else \
+            gpus_snapshot.get(chosen_uuids[0], {}).get("used", 0.0)
     return await _start_and_finalize(
         entry, target_model_id, model_cfg, gpu_uuids=chosen_uuids, effective_tp=effective_tp,
         effective_util=effective_util, run_discovery=run_discovery,
@@ -1417,17 +1505,23 @@ async def proxy_request(request: Request):
         if target_container is None:
             raise HTTPException(status_code=500, detail=f"Failed to start or find container for model {target_model_id}")
 
-        # Route the request (no state/queue lock held; the semaphore stays held).
-        target_container.last_request_time = time.time()
+        # Claim an in-flight slot under state_lock with a status RE-CHECK (G3): the container could
+        # have flipped STOPPING (eviction/idle-unload) between resolution and now. The increment and
+        # the READY check are atomic, so stop_container's drain can't miss this request and we never
+        # route to a container being torn down.
+        async with state_lock:
+            if target_container.status != ContainerStatus.READY:
+                raise HTTPException(status_code=503,
+                                    detail=f"Model {target_model_id} container became unavailable; retry.")
+            target_container.last_request_time = time.time()
+            target_container.active_requests += 1
+        active_req_decremented = False
+
         query_string = str(request.url.query) if request.url.query else ""
         vllm_url = f"http://{target_container.ip_address}:{target_container.port}{request.url.path}"
         if query_string:
             vllm_url += f"?{query_string}"
         current_queue_depth = model_queue_counts.get(target_model_id, 0)
-
-        # Track in-flight requests for graceful draining (streaming generator owns its own decrement).
-        target_container.active_requests += 1
-        active_req_decremented = False
 
         try:
             body['model'] = target_model_id
@@ -1458,7 +1552,7 @@ async def proxy_request(request: Request):
                                 if chunk:
                                     yield chunk
                     finally:
-                        captured_container.active_requests -= 1
+                        await _release_active(captured_container)
                         captured_sem.release()
 
                 sem_released = True
@@ -1500,7 +1594,7 @@ async def proxy_request(request: Request):
             raise HTTPException(status_code=503, detail=f"Could not connect to vLLM service: {e}")
         finally:
             if not active_req_decremented:
-                target_container.active_requests -= 1
+                await _release_active(target_container)
     except BaseException:
         # Exception cleanup: If the counter was incremented but never decremented
         # (because exception occurred before or during the decrement operation),
