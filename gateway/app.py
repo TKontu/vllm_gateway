@@ -47,6 +47,15 @@ NVIDIA_UTILITY_IMAGE = os.getenv("NVIDIA_UTILITY_IMAGE", "nvidia/cuda:12.1.0-bas
 MEMORY_FOOTPRINT_FILE = os.getenv("MEMORY_FOOTPRINT_FILE", "/app/data/memory_footprints.json")
 VLLM_TEMP_DIR = os.getenv("VLLM_TEMP_DIR", "/tmp")
 
+# Optional LD_LIBRARY_PATH for the spawned vLLM worker containers. Leave unset for the normal
+# case (the image's bundled cuda-compat libcuda is correct when the host driver is OLDER than the
+# image's CUDA). Set it when the host driver is NEWER than the image's cuda-compat lib: the compat
+# libcuda then can't talk to the newer kernel module and CUDA init fails with error 803
+# (cudaErrorSystemDriverMismatch). Pointing the loader at the host driver libs the NVIDIA Container
+# Toolkit mounts at /usr/lib/x86_64-linux-gnu makes the worker use the real (host) libcuda, e.g.:
+#   WORKER_LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/local/nvidia/lib64:/usr/local/cuda/lib64
+WORKER_LD_LIBRARY_PATH = os.getenv("WORKER_LD_LIBRARY_PATH", "").strip()
+
 # Path to the per-model YAML config. When present, it replaces ALLOWED_MODELS_JSON.
 MODELS_CONFIG_FILE = os.getenv("MODELS_CONFIG_FILE", "/app/config/models.yaml")
 
@@ -1005,6 +1014,9 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
                 "HUGGING_FACE_HUB_TOKEN": HF_TOKEN,
                 "VLLM_ALLOW_LONG_MAX_MODEL_LEN": "1",
                 "VLLM_CACHE_BUST": str(uuid.uuid4()),
+                # When set, override the loader path so the worker uses the host driver's libcuda
+                # instead of the image's bundled cuda-compat lib (see WORKER_LD_LIBRARY_PATH).
+                **({"LD_LIBRARY_PATH": WORKER_LD_LIBRARY_PATH} if WORKER_LD_LIBRARY_PATH else {}),
             },
             ipc_mode="host",
             device_requests=device_requests,
