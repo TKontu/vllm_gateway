@@ -21,12 +21,14 @@ ALLOWED_CONFIG_KEYS = {
     "inactivity_timeout",
     "always_on",
     "extra_args",
+    "pool",  # name of the GPU pool this model is placed in (multi-GPU); None = default pool
+    "colocate",  # if true, may share a GPU with other co-locatable models (Phase 3)
 }
 
 # Per-model entries additionally require/allow "repo".
 ALLOWED_MODEL_KEYS = ALLOWED_CONFIG_KEYS | {"repo"}
 
-ALLOWED_TOP_LEVEL_KEYS = {"defaults", "models"}
+ALLOWED_TOP_LEVEL_KEYS = {"defaults", "models", "pools"}
 
 
 @dataclass
@@ -42,6 +44,8 @@ class ModelConfig:
     inactivity_timeout: int
     always_on: bool
     extra_args: list
+    pool: Optional[str]  # GPU pool name (multi-GPU placement); None = the default/implicit pool
+    colocate: bool  # may share a GPU with other co-locatable models (Phase 3)
 
 
 def _require_int(field: str, model: str, value):
@@ -89,6 +93,14 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
     if not isinstance(extra_args, list):
         raise ValueError(f"model '{name}': 'extra_args' must be a list, got {extra_args!r}")
 
+    pool = merged["pool"]
+    if pool is not None and (not isinstance(pool, str) or not pool.strip()):
+        raise ValueError(f"model '{name}': 'pool' must be a non-empty string or null, got {pool!r}")
+
+    colocate = merged["colocate"]
+    if not isinstance(colocate, bool):
+        raise ValueError(f"model '{name}': 'colocate' must be a boolean, got {colocate!r}")
+
     return ModelConfig(
         name=name,
         repo=repo,
@@ -101,6 +113,8 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
         always_on=always_on,
         # Fresh list of strings; never share the builtins/defaults list across models.
         extra_args=[str(a) for a in extra_args],
+        pool=pool.strip() if isinstance(pool, str) else None,
+        colocate=colocate,
     )
 
 
@@ -169,3 +183,144 @@ def build_fallback_configs(allowed_models: dict, builtins: dict) -> "dict[str, M
     for name, repo in allowed_models.items():
         out[name] = _construct(name, repo, dict(builtins))
     return out
+
+
+def resolve_pools(raw: dict) -> "dict[str, list]":
+    """Parse and validate the optional top-level ``pools`` section.
+
+    Returns {pool_name: [gpu_uuid, ...]}, or {} when no ``pools`` key is present
+    (single-pool / backward-compatible mode). Raises ValueError (fail fast) on a
+    malformed declaration so the gateway never starts with an ambiguous GPU topology.
+    """
+    if not isinstance(raw, dict) or "pools" not in raw:
+        return {}
+
+    pools = raw["pools"]
+    if not isinstance(pools, dict) or not pools:
+        raise ValueError("'pools' must be a non-empty mapping of pool-name -> [gpu-uuid, ...]")
+
+    seen = {}  # uuid -> pool name, to catch a UUID assigned to two pools
+    resolved: "dict[str, list]" = {}
+    for pool_name, uuids in pools.items():
+        if not isinstance(uuids, list) or not uuids:
+            raise ValueError(f"pool '{pool_name}' must be a non-empty list of GPU UUIDs")
+        clean = []
+        for u in uuids:
+            if not isinstance(u, str) or not u.strip():
+                raise ValueError(f"pool '{pool_name}' contains an invalid GPU UUID: {u!r}")
+            u = u.strip()
+            if u in seen:
+                raise ValueError(f"GPU UUID {u!r} is in both pools '{seen[u]}' and '{pool_name}'")
+            seen[u] = pool_name
+            clean.append(u)
+        resolved[pool_name] = clean
+    return resolved
+
+
+def validate_model_pools(configs: "dict[str, ModelConfig]", pools: "dict[str, list]") -> None:
+    """Ensure each model's resolved pool names a declared pool. Raises ValueError on mismatch.
+
+    When ``pools`` is empty (no multi-GPU topology), a stray per-model ``pool`` is meaningless
+    and ignored by the caller; we don't raise so adding ``pool:`` can't break the fallback path.
+    When ``pools`` is declared, every model must name one (an explicit ``pool`` or a
+    ``defaults.pool``) — a pool-less model would otherwise have no GPUs to place onto.
+    """
+    if not pools:
+        return
+    declared = set(pools)
+    for name, cfg in configs.items():
+        if cfg.pool is None:
+            raise ValueError(
+                f"model '{name}': no pool set, but pools are declared. Set 'pool' on the model "
+                f"or a 'defaults.pool'; declared pools: {sorted(declared)}"
+            )
+        if cfg.pool not in declared:
+            raise ValueError(
+                f"model '{name}': pool '{cfg.pool}' is not a declared pool; declared: {sorted(declared)}"
+            )
+
+
+def validate_tp_against_pools(configs: "dict[str, ModelConfig]", pools: "dict[str, list]") -> None:
+    """Fail fast when a model's tensor_parallel_size exceeds the GPUs declared in its pool.
+
+    Only meaningful when ``pools`` is declared (the GPU count per pool is then known at load
+    time). Homogeneity (equal VRAM) can only be checked at runtime; placement enforces that.
+    """
+    if not pools:
+        return
+    for name, cfg in configs.items():
+        if cfg.tensor_parallel_size > 1 and cfg.pool in pools:
+            available = len(pools[cfg.pool])
+            if cfg.tensor_parallel_size > available:
+                raise ValueError(
+                    f"model '{name}': tensor_parallel_size={cfg.tensor_parallel_size} exceeds the "
+                    f"{available} GPU(s) declared in pool '{cfg.pool}'"
+                )
+
+
+def migrate_footprints(raw: dict) -> dict:
+    """Normalize the footprints file to the per-model record shape.
+
+    New shape: {repo: {"per_gpu_mib": float, "effective_tp": int, "measured_at": float}}.
+    Legacy shape was {repo: number} (a per-GPU footprint measured at tp=1; 0 = unmeasurable
+    sentinel). Migrate legacy scalar values forward (assume tp=1). Records already in the new
+    shape pass through. Unparseable entries are dropped.
+    """
+    out = {}
+    if not isinstance(raw, dict):
+        return out
+    for repo, val in raw.items():
+        if isinstance(val, dict) and "per_gpu_mib" in val:
+            out[repo] = {
+                "per_gpu_mib": float(val.get("per_gpu_mib", 0.0)),
+                "effective_tp": int(val.get("effective_tp", 1) or 1),
+                "measured_at": float(val.get("measured_at", 0.0)),
+            }
+        elif isinstance(val, (int, float)) and not isinstance(val, bool):
+            out[repo] = {"per_gpu_mib": float(val), "effective_tp": 1, "measured_at": 0.0}
+        # anything else: drop (corrupt entry)
+    return out
+
+
+def validate_pools_visible(pools: "dict[str, list]", visible_uuids: "set") -> None:
+    """Fail fast if any configured GPU UUID isn't visible to nvidia-smi.
+
+    Runs at startup AFTER the GPU probe (the visible set is a runtime fact). Catches the common
+    typo in a long `GPU-xxxx...` UUID, instead of silently treating that GPU as having 0 VRAM
+    (which would make its pool unplaceable with only a log warning).
+    """
+    if not pools:
+        return
+    missing = []
+    for pool_name, uuids in pools.items():
+        for u in uuids:
+            if u not in visible_uuids:
+                missing.append(f"{u} (pool '{pool_name}')")
+    if missing:
+        raise ValueError(
+            "Configured GPU UUID(s) not visible to nvidia-smi: " + "; ".join(missing) +
+            f". Visible: {sorted(visible_uuids)}. Check pools/GATEWAY_GPU_UUID against `nvidia-smi -L`."
+        )
+
+
+def validate_colocate(configs: "dict[str, ModelConfig]", max_share: float = 0.9) -> None:
+    """Validate co-location settings. Raises on a hard conflict; warns on a soft smell.
+
+    Co-location is single-GPU only, so it is incompatible with tensor parallel. A co-locatable
+    model whose share (gpu_memory_utilization) is near a whole card won't actually co-locate —
+    that's a config smell, logged as a warning, not an error.
+    """
+    import logging
+    for name, cfg in configs.items():
+        if not cfg.colocate:
+            continue
+        if cfg.tensor_parallel_size > 1:
+            raise ValueError(
+                f"model '{name}': colocate=true is incompatible with tensor_parallel_size="
+                f"{cfg.tensor_parallel_size} (co-location is single-GPU only)"
+            )
+        if cfg.gpu_memory_utilization > max_share:
+            logging.warning(
+                f"model '{name}': colocate=true but gpu_memory_utilization="
+                f"{cfg.gpu_memory_utilization} > {max_share}; it will rarely fit alongside another model."
+            )

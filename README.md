@@ -154,6 +154,50 @@ must be a list). Any error is logged and the gateway refuses to start.
 legacy `ALLOWED_MODELS_JSON` env var with the global `VLLM_*` settings — behaving exactly as
 before this feature existed.
 
+## Multi-GPU pools
+
+One gateway can manage several GPUs by declaring a `pools:` section and assigning each model to a
+pool with `pool:`. Get the full UUIDs from `nvidia-smi -L`.
+
+```yaml
+pools:
+  llm:  [GPU-aaaa-…]   # RTX 3090 — LLMs
+  util: [GPU-bbbb-…]   # RTX A2000 — small/utility models
+defaults: { pool: llm, gpu_memory_utilization: 0.90 }
+models:
+  qwen3-30b-awq: { repo: …, quantization: awq, pool: llm }
+  small-util:    { repo: …, pool: util, gpu_memory_utilization: 0.45 }
+```
+
+- **Placement.** On each request the gateway picks a GPU *within the model's pool*: a card with
+  enough free VRAM (tie-break: most free); if none fits, it evicts idle models (LRU, never
+  `always_on` or in-flight) on a pool GPU; if it still can't fit, it returns **503** (it never
+  over-commits and risks an OOM). Per-GPU accounting uses *actual* free VRAM from `nvidia-smi`, so
+  it tolerates VRAM used by processes the gateway didn't start.
+- **Tensor parallel.** Set `tensor_parallel_size: k` to spread one model across `k` GPUs of its
+  pool (launched with `--tensor-parallel-size k`, pinned to those cards). TP requires a
+  **homogeneous** pool (equal-VRAM GPUs — never a 3090+A2000 mix; the util pool's single A2000
+  never TPs) and `k` must not exceed the GPUs declared in the pool (validated at startup). A model
+  with `tensor_parallel_size: 1` whose **weights exceed one card** auto-falls-back to the minimal TP
+  that fits. TP over PCIe (no NVLink) has real comms cost, so prefer single-GPU when a model fits.
+  Each card is still filled to `gpu_memory_utilization` (TP fits bigger *weights*, not more KV).
+- **Co-location.** Set `colocate: true` to let small models **share a card**. A co-locatable
+  model's `gpu_memory_utilization` is its intended per-card *share* (e.g. `0.45`, so two fit a 24 GB
+  card); the gateway caps the launch util to the chosen card's *actual free* VRAM (minus a margin,
+  `COLOCATE_MARGIN_MIB`, default 1024) so a second model never OOMs the first. Co-locatable models
+  only share with each other (a whole-card model never shares), are evicted only as needed (idle,
+  LRU), and co-location is **single-GPU only** (not combinable with `tensor_parallel_size > 1`).
+  Default (`colocate: false`) keeps whole-card placement. Expect per-model throughput to drop when a
+  card is shared (contended SMs/KV) — opt in for lightly-used helpers, not your hot path.
+- **GPU source precedence.** `pools:` in config → else `GATEWAY_GPU_UUID` (a single-GPU pool) →
+  else all visible GPUs (the legacy single-pool behavior). When no `pools:` are declared, behavior
+  is unchanged.
+- **Embeddings/rerankers** are expected to run **out of band** — a separate always-on
+  [TEI](https://github.com/huggingface/text-embeddings-inference) or
+  [infinity](https://github.com/michaelfeil/infinity) container pinned to the A2000 — **not**
+  through this swapping gateway. The gateway's `util` pool can still place small models on the same
+  A2000 because it reads the card's real free VRAM. See `/gateway/status` for per-GPU pool/usage/residents.
+
 ## Configuration
 
 All configuration is done via environment variables, making it easy to deploy with Portainer, Kubernetes, or directly from GitHub.

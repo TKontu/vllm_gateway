@@ -11,7 +11,11 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
-from config_loader import resolve_model_configs, build_fallback_configs  # noqa: E402
+from config_loader import (  # noqa: E402
+    resolve_model_configs, build_fallback_configs, resolve_pools,
+    validate_model_pools, validate_tp_against_pools, validate_colocate,
+    validate_pools_visible, migrate_footprints,
+)
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
 BUILTINS = {
@@ -23,6 +27,8 @@ BUILTINS = {
     "inactivity_timeout": 1800,
     "always_on": False,
     "extra_args": [],
+    "pool": None,
+    "colocate": False,
 }
 
 
@@ -136,6 +142,153 @@ def test_fallback_matches_builtins():
     assert c.inactivity_timeout == 1800
     assert c.always_on is False
     print("ok: fallback configs match builtins")
+
+
+# --- pools (multi-GPU) ---
+
+def test_resolve_pools_absent_and_valid():
+    assert resolve_pools({"models": {}}) == {}
+    pools = resolve_pools({"pools": {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}, "models": {}})
+    assert pools == {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}
+    print("ok: resolve_pools absent + valid")
+
+
+def test_resolve_pools_errors():
+    for raw, needle in [
+        ({"pools": {}}, "non-empty"),
+        ({"pools": {"llm": []}}, "non-empty list"),
+        ({"pools": {"llm": ["GPU-a", "  "]}}, "invalid GPU UUID"),
+        ({"pools": {"llm": ["GPU-a"], "util": ["GPU-a"]}}, "both pools"),
+    ]:
+        try:
+            resolve_pools(raw)
+        except ValueError as e:
+            assert needle in str(e), f"{needle!r} not in {e}"
+        else:
+            raise AssertionError(f"expected ValueError containing {needle!r}")
+    print("ok: resolve_pools errors")
+
+
+def test_pool_precedence_and_field():
+    raw = {
+        "defaults": {"pool": "llm"},
+        "models": {
+            "a": {"repo": "o/a"},                 # inherits defaults.pool
+            "b": {"repo": "o/b", "pool": "util"}, # per-model overrides
+        },
+    }
+    cfgs = resolve_model_configs(raw, BUILTINS)
+    assert cfgs["a"].pool == "llm"
+    assert cfgs["b"].pool == "util"
+    print("ok: pool precedence + field")
+
+
+def test_validate_model_pools():
+    pools = {"llm": ["GPU-a"], "util": ["GPU-b"]}
+    cfgs = resolve_model_configs({"models": {"a": {"repo": "o/a", "pool": "llm"}}}, BUILTINS)
+    validate_model_pools(cfgs, pools)  # ok
+    bad = resolve_model_configs({"models": {"a": {"repo": "o/a", "pool": "nope"}}}, BUILTINS)
+    try:
+        validate_model_pools(bad, pools)
+    except ValueError as e:
+        assert "not a declared pool" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for undeclared pool")
+    # pool set but no pools declared -> ignored (no raise)
+    validate_model_pools(bad, {})
+    print("ok: validate_model_pools")
+
+
+def test_poolless_model_rejected_when_pools_declared():
+    pools = {"llm": ["GPU-a"]}
+    cfgs = resolve_model_configs({"models": {"a": {"repo": "o/a"}}}, BUILTINS)  # no pool, no default
+    try:
+        validate_model_pools(cfgs, pools)
+    except ValueError as e:
+        assert "no pool set" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for pool-less model under declared pools")
+    # but with a defaults.pool it resolves and passes
+    ok = resolve_model_configs({"defaults": {"pool": "llm"}, "models": {"a": {"repo": "o/a"}}}, BUILTINS)
+    validate_model_pools(ok, pools)
+    print("ok: pool-less model rejected when pools declared")
+
+
+def test_validate_tp_against_pools():
+    pools = {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}
+    # tp=2 with 2-GPU pool -> ok
+    ok = resolve_model_configs({"models": {"m": {"repo": "o/m", "pool": "llm", "tensor_parallel_size": 2}}}, BUILTINS)
+    validate_tp_against_pools(ok, pools)
+    # tp=2 in a 1-GPU pool -> raises
+    bad = resolve_model_configs({"models": {"m": {"repo": "o/m", "pool": "util", "tensor_parallel_size": 2}}}, BUILTINS)
+    try:
+        validate_tp_against_pools(bad, pools)
+    except ValueError as e:
+        assert "exceeds" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for tp > pool size")
+    # no pools declared -> never raises on tp
+    validate_tp_against_pools(bad, {})
+    print("ok: validate_tp_against_pools")
+
+
+def test_colocate_field_and_validation():
+    # default false; override true; precedence via defaults
+    cfgs = resolve_model_configs(
+        {"defaults": {"colocate": True}, "models": {"a": {"repo": "o/a"}, "b": {"repo": "o/b", "colocate": False}}},
+        BUILTINS)
+    assert cfgs["a"].colocate is True and cfgs["b"].colocate is False
+    # non-bool rejected
+    try:
+        resolve_model_configs({"models": {"m": {"repo": "o/m", "colocate": "yes"}}}, BUILTINS)
+    except ValueError as e:
+        assert "colocate" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for non-bool colocate")
+    print("ok: colocate field + type validation")
+
+
+def test_validate_colocate_forbids_tp():
+    ok = resolve_model_configs({"models": {"m": {"repo": "o/m", "colocate": True}}}, BUILTINS)
+    validate_colocate(ok)  # tp defaults to 1 -> fine
+    bad = resolve_model_configs(
+        {"models": {"m": {"repo": "o/m", "colocate": True, "tensor_parallel_size": 2}}}, BUILTINS)
+    try:
+        validate_colocate(bad)
+    except ValueError as e:
+        assert "incompatible" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for colocate + tp>1")
+    print("ok: validate_colocate forbids TP")
+
+
+def test_validate_pools_visible():
+    pools = {"llm": ["GPU-a", "GPU-b"], "util": ["GPU-c"]}
+    validate_pools_visible(pools, {"GPU-a", "GPU-b", "GPU-c", "GPU-x"})  # all present -> ok
+    validate_pools_visible({}, set())  # no pools -> ok
+    try:
+        validate_pools_visible(pools, {"GPU-a", "GPU-c"})  # GPU-b missing
+    except ValueError as e:
+        assert "GPU-b" in str(e) and "not visible" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for a missing UUID")
+    print("ok: validate_pools_visible")
+
+
+def test_migrate_footprints():
+    # legacy {repo: number} -> record with tp=1; new shape passes through; corrupt dropped.
+    out = migrate_footprints({
+        "org/a": 20000,                                              # legacy scalar
+        "org/b": {"per_gpu_mib": 13000, "effective_tp": 2, "measured_at": 5.0},  # new shape
+        "org/c": 0,                                                  # legacy sentinel
+        "org/bad": "nonsense",                                       # corrupt -> dropped
+    })
+    assert out["org/a"] == {"per_gpu_mib": 20000.0, "effective_tp": 1, "measured_at": 0.0}
+    assert out["org/b"]["effective_tp"] == 2 and out["org/b"]["per_gpu_mib"] == 13000.0
+    assert out["org/c"] == {"per_gpu_mib": 0.0, "effective_tp": 1, "measured_at": 0.0}
+    assert "org/bad" not in out
+    assert migrate_footprints({}) == {} and migrate_footprints(None) == {}
+    print("ok: migrate_footprints")
 
 
 if __name__ == "__main__":

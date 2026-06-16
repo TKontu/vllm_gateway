@@ -8,7 +8,32 @@
 # Resolution precedence per setting:
 #   per-model entry  >  defaults block  >  built-in default (the old env var)
 
+# --- GPU pools (optional, multi-GPU) ---------------------------------------
+# Declare the GPUs this gateway manages and group them into named pools. Get the
+# full UUIDs from `nvidia-smi -L`. A model is placed on a GPU within its pool.
+#   - If 'pools' is omitted, the gateway runs single-pool: the GATEWAY_GPU_UUID
+#     pin if set, else all visible GPUs (unchanged legacy behavior).
+#   - By default each model gets ~its whole GPU at its gpu_memory_utilization
+#     (whole-card placement). Set colocate: true to let small models SHARE a card
+#     (their gpu_memory_utilization is their per-card share; co-locatable models only
+#     share with each other; single-GPU only — not combinable with tensor parallel).
+#   - Tensor-parallel (tensor_parallel_size > 1) spreads ONE model across several
+#     GPUs of its pool. TP requires a HOMOGENEOUS pool (equal-VRAM cards) — never
+#     mix a 3090 and an A2000. TP over PCIe (no NVLink) has real comms cost, so use
+#     it only for models that genuinely won't fit on one card.
+# NOTE: Embeddings/rerankers are expected to run OUT OF BAND — a separate always-on
+# TEI/infinity container pinned to the A2000 — NOT through this gateway. They are
+# therefore intentionally absent below. The gateway's 'util' pool reads the A2000's
+# real free VRAM (via nvidia-smi), so it accounts for that external embedder.
+pools:
+  llm:                                   # RTX 3090s (homogeneous) — LLMs; TP-capable
+    - GPU-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    - GPU-zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz
+  util:                                  # RTX A2000 — small/utility models (shares card with embedder)
+    - GPU-yyyyyyyy-yyyy-yyyy-yyyy-yyyyyyyyyyyy
+
 defaults:                      # optional; applied to every model unless overridden
+  pool: llm                    # default pool for models that don't set one
   gpu_memory_utilization: 0.90 # 0 < x <= 1
   max_model_len: 0             # 0 = use the model's native max (omit the flag)
   tensor_parallel_size: 1
@@ -16,17 +41,20 @@ defaults:                      # optional; applied to every model unless overrid
   dtype: auto                  # auto | float16 | bfloat16 | ...
   inactivity_timeout: 1800     # seconds of idleness before unload; 0 = never unload
   always_on: false             # if true, never auto-unloaded
-  extra_args: []               # raw vLLM CLI args, appended verbatim (override generated flags)
+  extra_args: []               # raw vLLM CLI args, appended verbatim. NOTE: --model,
+                               # --gpu-memory-utilization and --tensor-parallel-size are
+                               # gateway-managed (set from placement) and ignored here if present.
 
 models:                        # required, non-empty
-  # A small instruct model on its native context length.
+  # A small instruct model on its native context length (default pool: llm).
   gemma3-4B:
     repo: google/gemma-3-4b-it
 
-  # An AWQ-quantized model.
+  # An AWQ-quantized model on the LLM pool.
   qwen3-30b-awq:
     repo: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
     quantization: awq
+    pool: llm
 
   # A model pinned to a custom (capped) context length and a couple of extra flags.
   qwen2.5-coder:
@@ -35,8 +63,33 @@ models:                        # required, non-empty
     extra_args:
       - "--enable-prefix-caching"
 
-  # An always-on embedding model that is never unloaded by the inactivity monitor.
-  bge-m3:
-    repo: BAAI/bge-m3
-    always_on: true
-    inactivity_timeout: 0
+  # A small utility model placed on the A2000 'util' pool (e.g. a captioning/OCR helper).
+  small-util:
+    repo: Qwen/Qwen2.5-3B-Instruct
+    pool: util
+    gpu_memory_utilization: 0.45   # leave headroom for the external embedder on the A2000
+
+  # Two small models that SHARE one 3090 via co-location. Each asks for ~45% of the card
+  # (sum ~0.9 fits one 24 GB GPU); the gateway caps the launch util to actual free space so
+  # the second never OOMs the first. colocate models pack together and are evicted only as
+  # needed. Good for several small helpers that are each lightly used.
+  guard-small:
+    repo: meta-llama/Llama-Guard-3-1B
+    pool: llm
+    colocate: true
+    gpu_memory_utilization: 0.45
+  rewriter-small:
+    repo: Qwen/Qwen2.5-1.5B-Instruct
+    pool: llm
+    colocate: true
+    gpu_memory_utilization: 0.45
+
+  # A large model forced across both 3090s with tensor parallel. tensor_parallel_size must
+  # not exceed the GPUs declared in the pool (validated at startup), and the pool must be
+  # homogeneous (checked at placement). Models that fit on one card stay single-GPU; a model
+  # too big for one card auto-falls-back to the minimal TP that fits even without this flag.
+  big-llm-tp2:
+    repo: cyankiwi/Qwen3.5-27B-AWQ-4bit
+    quantization: awq
+    pool: llm
+    tensor_parallel_size: 2
