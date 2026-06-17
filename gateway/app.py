@@ -907,13 +907,14 @@ async def get_model_max_len(model_id: str) -> int:
 async def estimate_weight_bytes(model_id: str) -> "int | None":
     """Best-effort estimate of a model's on-disk weight size in bytes (quantization-aware).
 
-    Primary: sum the sizes of all *.safetensors files from HF model metadata
-    (HfApi().model_info(files_metadata=True)) — handles single-file AND sharded repos, and gated
-    repos via the token. Fallback: the shard index's total_size (sharded only). Returns None when
-    neither works (e.g. GGUF / non-safetensors), so the caller degrades to discovery / configured tp."""
+    Order: (1) sum *.safetensors sizes from HF metadata (HfApi().model_info(files_metadata=True));
+    (2) if the metadata lists the files but not their sizes (HF Xet-backed repos report size=None),
+    HEAD each file for its byte size; (3) the shard index's total_size (sharded only); else None
+    (GGUF / non-safetensors) so the caller degrades to discovery. Gated repos work via the token."""
     if is_gguf_model(model_id) or '/' not in model_id or model_id.startswith(('http://', 'https://')):
         return None
     token = HF_TOKEN if HF_TOKEN and HF_TOKEN.strip() else None
+    st_names = []  # *.safetensors filenames (for the HEAD fallback)
     try:
         info = await run_in_executor(partial(HfApi().model_info, model_id,
                                              files_metadata=True, token=token))
@@ -921,17 +922,36 @@ async def estimate_weight_bytes(model_id: str) -> "int | None":
         for s in (getattr(info, "siblings", None) or []):
             name = getattr(s, "rfilename", "") or ""
             if name.endswith(".safetensors"):
+                st_names.append(name)
                 size = getattr(s, "size", None)
                 if size:
                     total += int(size)
         if total > 0:
             return total
     except Exception as e:
-        logging.warning(f"model_info weight sizing failed for {model_id}: {e}; trying shard index.")
-    # Fallback: shard index total_size (present only for multi-shard models).
+        logging.warning(f"model_info weight sizing failed for {model_id}: {e}; trying file HEAD / index.")
+    # (2) Metadata listed the files but not their sizes (e.g. Xet) -> HEAD each for Content-Length.
+    # Default to the conventional single file if model_info gave us nothing usable.
+    head_total = 0
+    for name in (st_names or ["model.safetensors"]):
+        url = f"https://huggingface.co/{model_id}/resolve/main/{name}"
+        try:
+            resp = await http_client.head(url, follow_redirects=True, timeout=httpx.Timeout(10.0),
+                                          headers=_hf_auth_headers())
+            if resp.status_code == 200:
+                # HF returns the true LFS/Xet object size in X-Linked-Size; else the CDN Content-Length.
+                cl = resp.headers.get("x-linked-size") or resp.headers.get("content-length")
+                if cl and int(cl) > 0:
+                    head_total += int(cl)
+        except Exception as e:
+            logging.warning(f"HEAD size failed for {model_id}/{name}: {e}")
+    if head_total > 0:
+        return head_total
+    # (3) Fallback: shard index total_size (present only for multi-shard models).
     index_url = f"https://huggingface.co/{model_id}/raw/main/model.safetensors.index.json"
     try:
-        resp = await http_client.get(index_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
+        resp = await http_client.get(index_url, follow_redirects=True, timeout=httpx.Timeout(10.0),
+                                     headers=_hf_auth_headers())
         if resp.status_code == 200:
             total = resp.json().get("metadata", {}).get("total_size")
             if isinstance(total, int) and total > 0:
