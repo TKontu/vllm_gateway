@@ -12,8 +12,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
 from placement import (  # noqa: E402
     select_evictions, select_gpu, GpuView, select_placement, minimal_tp_to_fit, _homogeneous,
-    select_colocated, compute_effective_tp,
+    select_colocated, compute_effective_tp, kv_cache_mib, estimate_need_mib,
+    attribute_vram, footprint_signature, signature_matches,
 )
+import math  # noqa: E402
 
 
 @dataclass
@@ -304,6 +306,120 @@ def test_select_colocated_blocked_gpus():
     # If both are blocked -> None.
     uuid2, _ = select_colocated([a, b], rbg, lambda g: 8000, {"A", "B"}, NOW, 90)
     assert uuid2 is None
+
+
+# --- Phase 4: budget placement (kv_cache_mib, estimate_need_mib, GpuView.budget) ---
+
+def test_kv_cache_mib_known_value():
+    # Llama-3-8B-ish: 32 layers, 8 kv heads, head_dim 128, bf16(2B), 8192 ctx x 16 seqs.
+    # bytes/token = 2 * 32 * 8 * 128 * 2 = 131072; * 8192 * 16 = 17_179_869_184 B = 16384 MiB.
+    assert kv_cache_mib(8192, 16, 32, 8, 128, 2) == 16384.0
+    # Halving concurrency halves the KV.
+    assert kv_cache_mib(8192, 8, 32, 8, 128, 2) == 8192.0
+    # Any non-positive/None input -> 0.0 (unknown -> caller falls back to discovery).
+    assert kv_cache_mib(0, 16, 32, 8, 128, 2) == 0.0
+    assert kv_cache_mib(8192, 16, 32, 8, None, 2) == 0.0
+
+
+def test_estimate_need_mib_overhead_and_tp():
+    approx = lambda a, b: abs(a - b) < 1e-6  # noqa: E731
+    # (16000 + 5000) * 1.1 + 1024 = 24124 at tp=1.
+    assert approx(estimate_need_mib(16000, 5000, 1, 1.1, 1024), 24124.0)
+    # tp=2 shards weights+KV across 2 cards but the fixed margin is per-card:
+    # (21000/2) * 1.1 + 1024 = 11550 + 1024 = 12574.
+    assert approx(estimate_need_mib(16000, 5000, 2, 1.1, 1024), 12574.0)
+    # No KV known (0) -> weights-only + overhead.
+    assert approx(estimate_need_mib(10000, 0, 1, 1.0, 0), 10000.0)
+
+
+def test_gpuview_budget_caps_free():
+    # 24 GB card, nothing used. budget cap 0.5*24000 = 12000 is tighter than physical (24000).
+    g = GpuView("A", total=24000, used_smi=0, ready_footprint=0, budget=12000)
+    assert g.free == 12000
+    # With a gateway model already holding 8000, budget_free = 12000-8000 = 4000 (still tighter).
+    g2 = GpuView("A", total=24000, used_smi=8000, ready_footprint=8000, budget=12000)
+    assert g2.free == 4000
+    # External (non-gateway) VRAM makes physical tighter than budget: used_smi 22000, no gateway
+    # models -> physical 2000 < budget_free 12000.
+    g3 = GpuView("A", total=24000, used_smi=22000, ready_footprint=0, budget=12000)
+    assert g3.free == 2000
+    # Default budget is inf -> identical to legacy physical-only free.
+    g4 = GpuView("A", total=24000, used_smi=5000, ready_footprint=5000)
+    assert math.isinf(g4.budget) and g4.free == 19000
+
+
+def test_budget_packs_two_models_no_eviction():
+    # budget 0.9*24000 = 21600. Two ~10000-MiB models both fit (sum 20000 <= 21600) with no evict.
+    budget = 0.9 * 24000
+    g = GpuView("A", total=24000, used_smi=0, ready_footprint=0, budget=budget)
+    chosen, ev = select_gpu([g], {"A": []}, lambda gg: 10000, NOW, 90)
+    assert chosen == "A" and ev == []
+    # Second model arrives with the first resident (10000 used).
+    g2 = GpuView("A", total=24000, used_smi=10000, ready_footprint=10000, budget=budget)
+    res = [R("first", 10000, OLD, loaded_at=OLD)]
+    chosen2, ev2 = select_gpu([g2], {"A": res}, lambda gg: 10000, NOW, 90)
+    assert chosen2 == "A" and ev2 == []   # 10000 + 10000 = 20000 <= 21600, no eviction
+
+
+def test_budget_full_triggers_eviction():
+    # budget 21600 already holds two idle 10000 models (20000); a 10000 model needs room -> evict LRU.
+    budget = 0.9 * 24000
+    g = GpuView("A", total=24000, used_smi=20000, ready_footprint=20000, budget=budget)
+    res = [R("old", 10000, NOW - 900, loaded_at=OLD),
+           R("new", 10000, NOW - 5, loaded_at=OLD)]
+    chosen, ev = select_gpu([g], {"A": res}, lambda gg: 10000, NOW, 90)
+    assert chosen == "A" and ev == ["old"], (chosen, ev)   # free one slot, keep the newer model
+
+
+def test_budget_smaller_than_need_returns_none():
+    # A single model needs 15000 but the budget only allows 12000 and nothing is evictable.
+    g = GpuView("A", total=24000, used_smi=0, ready_footprint=0, budget=12000)
+    chosen, ev = select_gpu([g], {"A": []}, lambda gg: 15000, NOW, 90)
+    assert chosen is None, (chosen, ev)
+
+
+# --- Phase 5: sliding-window KV, per-process attribution, footprint signatures ---
+
+def test_kv_cache_mib_sliding_window():
+    # Gemma-3-like: 34 layers, 28 sliding (window 1024), 6 full; full attention vastly larger.
+    full = kv_cache_mib(32768, 8, 34, 8, 256, 2)
+    slide = kv_cache_mib(32768, 8, 34, 8, 256, 2, sliding_window=1024, num_sliding_layers=28)
+    assert slide < full / 3, (slide, full)            # sliding is far cheaper
+    # Window >= context collapses to full for those layers (no benefit).
+    eq = kv_cache_mib(512, 8, 34, 8, 256, 2, sliding_window=4096, num_sliding_layers=28)
+    assert eq == kv_cache_mib(512, 8, 34, 8, 256, 2)  # min(window, L) = L
+    # No sliding info -> identical to legacy all-full.
+    assert kv_cache_mib(8192, 16, 32, 8, 128, 2, sliding_window=0, num_sliding_layers=0) \
+        == kv_cache_mib(8192, 16, 32, 8, 128, 2)
+    # Hand value: 1 full layer, L=1000, 1 seq, 1 kv-head, head_dim 1, 2 bytes -> 2*1*1*2*1000/2^20.
+    assert abs(kv_cache_mib(1000, 1, 1, 1, 1, 2) - (2 * 1000 * 2) / (1024.0 * 1024.0)) < 1e-9
+
+
+def test_attribute_vram():
+    rows = [("GPU-a", 111, 8000.0), ("GPU-a", 222, 1200.0),
+            ("GPU-b", 333, 5000.0), ("GPU-a", 999, 4000.0)]  # 999 is a foreign process
+    # Only our pids on GPU-a.
+    assert attribute_vram(rows, {111, 222}, ["GPU-a"]) == 9200.0
+    # Tensor-parallel: sum our pid across both cards.
+    assert attribute_vram([("GPU-a", 1, 6000.0), ("GPU-b", 1, 6000.0)], {1}, ["GPU-a", "GPU-b"]) == 12000.0
+    # No match -> 0.0 (caller falls back to delta measurement).
+    assert attribute_vram(rows, {555}, ["GPU-a"]) == 0.0
+    assert attribute_vram([], {111}, ["GPU-a"]) == 0.0
+    # Malformed rows are skipped, not fatal.
+    assert attribute_vram([("GPU-a", "x", 1.0), ("GPU-a", 111, 50.0)], {111}, ["GPU-a"]) == 50.0
+
+
+def test_footprint_signature_and_match():
+    sig = footprint_signature("budget", 32768, 8, 1, util_basis=0.9)
+    assert signature_matches({"signature": sig}, sig)
+    # Any differing sizing input -> mismatch (forces re-measure).
+    assert not signature_matches({"signature": sig}, footprint_signature("whole_card", 32768, 8, 1, 0.9))
+    assert not signature_matches({"signature": sig}, footprint_signature("budget", 16384, 8, 1, 0.9))
+    assert not signature_matches({"signature": sig}, footprint_signature("budget", 32768, 16, 1, 0.9))
+    assert not signature_matches({"signature": sig}, footprint_signature("budget", 32768, 8, 2, 0.9))
+    # Legacy / missing signature never matches.
+    assert not signature_matches({"signature": {}}, sig)
+    assert not signature_matches({}, sig)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ import asyncio
 import httpx
 import docker
 import json
+import math
 import time
 import logging
 import uuid
@@ -14,13 +15,13 @@ from docker.types import DeviceRequest
 from docker.errors import NotFound, APIError
 from dataclasses import dataclass, field
 from enum import Enum
-from huggingface_hub import hf_hub_download, list_repo_files
+from huggingface_hub import hf_hub_download, list_repo_files, HfApi
 import yaml
 import placement
 from config_loader import (
     ModelConfig, resolve_model_configs, build_fallback_configs,
     resolve_pools, validate_model_pools, validate_tp_against_pools, validate_colocate,
-    validate_pools_visible, migrate_footprints,
+    validate_pools_visible, validate_budget_mode, validate_extra_args_budget, migrate_footprints,
 )
 
 # --- Logging Configuration ---
@@ -95,6 +96,20 @@ COLOCATE_MARGIN_MIB = int(os.getenv("COLOCATE_MARGIN_MIB", "1024"))
 COLOCATE_WEIGHT_OVERHEAD = float(os.getenv("COLOCATE_WEIGHT_OVERHEAD", "1.15"))
 COLOCATE_MAX_SHARE = float(os.getenv("COLOCATE_MAX_SHARE", "0.9"))
 
+# --- Placement mode (Phase 4) ---
+# 'budget'     : size each model to weights+KV+overhead and pack many models per card up to a
+#                per-GPU budget cap. Requires max_model_len > 0 per model (bounds the KV need).
+# 'whole_card' : legacy behavior — one model fills the card at its util; swap via LRU eviction.
+PLACEMENT_MODE = os.getenv("PLACEMENT_MODE", "budget").strip().lower()
+# Per-GPU budget: fraction of each card the gateway may fill IN TOTAL across all its models.
+# Defaults to the legacy global utilization so an existing deployment keeps the same ceiling.
+GPU_BUDGET_FRACTION = float(os.getenv("GPU_BUDGET_FRACTION", VLLM_GPU_MEMORY_UTILIZATION))
+# Need-estimate cushion: (weights + KV) * factor + a fixed per-card margin (CUDA context, cudagraphs).
+# Bias generous — the launch util cap means an under-estimate only fails THIS model's own startup,
+# never a co-resident, so erring large is safe.
+BUDGET_OVERHEAD_FACTOR = float(os.getenv("BUDGET_OVERHEAD_FACTOR", "1.1"))
+BUDGET_OVERHEAD_MIB = int(os.getenv("BUDGET_OVERHEAD_MIB", "1024"))
+
 # Timeout configuration (in seconds)
 GATEWAY_REQUEST_TIMEOUT = int(os.getenv("GATEWAY_REQUEST_TIMEOUT", "300"))  # Total request timeout (default 5 minutes)
 GATEWAY_CONNECT_TIMEOUT = int(os.getenv("GATEWAY_CONNECT_TIMEOUT", "10"))  # Connection establishment timeout
@@ -110,6 +125,14 @@ def validate_config():
         raise ValueError(f"GATEWAY_REQUEST_TIMEOUT must be > 0, got {GATEWAY_REQUEST_TIMEOUT}")
     if GATEWAY_CONNECT_TIMEOUT <= 0:
         raise ValueError(f"GATEWAY_CONNECT_TIMEOUT must be > 0, got {GATEWAY_CONNECT_TIMEOUT}")
+    if PLACEMENT_MODE not in ("budget", "whole_card"):
+        raise ValueError(f"PLACEMENT_MODE must be 'budget' or 'whole_card', got {PLACEMENT_MODE!r}")
+    if not (0 < GPU_BUDGET_FRACTION <= 1):
+        raise ValueError(f"GPU_BUDGET_FRACTION must be in (0, 1], got {GPU_BUDGET_FRACTION}")
+    if BUDGET_OVERHEAD_FACTOR < 1:
+        raise ValueError(f"BUDGET_OVERHEAD_FACTOR must be >= 1, got {BUDGET_OVERHEAD_FACTOR}")
+    if BUDGET_OVERHEAD_MIB < 0:
+        raise ValueError(f"BUDGET_OVERHEAD_MIB must be >= 0, got {BUDGET_OVERHEAD_MIB}")
 
     if GATEWAY_MAX_QUEUE_SIZE > 10000:
         logging.warning(f"GATEWAY_MAX_QUEUE_SIZE is very large ({GATEWAY_MAX_QUEUE_SIZE}). This may cause memory issues.")
@@ -397,6 +420,68 @@ async def get_used_vram() -> float:
         return 0.0
     return float(_managed_vram(gpus, "used"))
 
+async def get_compute_apps_vram() -> "list[tuple]":
+    """Per-process GPU memory: list of (gpu_uuid, host_pid, used_mib) for every compute process.
+
+    Same probe-container pattern as get_gpu_vram (sees all GPUs). PIDs are HOST pids, which line up
+    with `docker top` / container State.Pid. Returns [] when compute-apps is unsupported/empty
+    (older drivers, MIG) so the caller falls back to delta measurement."""
+    output = await run_nvidia_smi_in_container(
+        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"]
+    )
+    rows = []
+    for line in output.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            continue
+        guid, pid, mib = parts
+        if guid and pid.isdigit():
+            rows.append((guid, int(pid), _parse_float(mib)))  # mib is "[N/A]" sometimes -> 0.0
+    return rows
+
+async def container_host_pids(container) -> set:
+    """Host PIDs of every process in a container (covers vLLM's EngineCore worker children).
+
+    Uses `docker top` (host-PID view, independent of the container's PID namespace) plus the
+    container's init PID. Returns an empty set on failure (caller falls back)."""
+    pids = set()
+    try:
+        await run_in_executor(container.reload)
+        init_pid = container.attrs.get("State", {}).get("Pid")
+        if init_pid:
+            pids.add(int(init_pid))
+        top = await run_in_executor(container.top)
+        titles = (top or {}).get("Titles") or []
+        procs = (top or {}).get("Processes") or []
+        pid_idx = titles.index("PID") if "PID" in titles else 1
+        for row in procs:
+            try:
+                pids.add(int(row[pid_idx]))
+            except (ValueError, IndexError, TypeError):
+                continue
+    except Exception as e:
+        logging.warning(f"Could not enumerate container PIDs: {e}")
+    return pids
+
+async def measure_model_vram(container_name: str, gpu_uuids: list) -> "float | None":
+    """Ground-truth VRAM (MiB) actually used by a model's container across its gpu_uuids, via
+    per-process attribution (nvidia-smi compute-apps -> the container's host PIDs). Returns None when
+    attribution is unavailable (no compute-apps support, PID mapping empty, or zero match) so the
+    caller can fall back to delta measurement."""
+    try:
+        container = await run_in_executor(docker_client.containers.get, container_name)
+        pids = await container_host_pids(container)
+        if not pids:
+            return None
+        rows = await get_compute_apps_vram()
+        if not rows:
+            return None
+        mib = placement.attribute_vram(rows, pids, gpu_uuids or [])
+        return mib if mib > 0 else None
+    except Exception as e:
+        logging.warning(f"Per-process VRAM attribution failed for {container_name}: {e}")
+        return None
+
 DEFAULT_POOL = "_default"  # implicit pool used in the single-pool / backward-compatible cases
 
 def resolve_managed_pools():
@@ -589,6 +674,9 @@ def builtin_model_defaults() -> dict:
         "gpu_memory_utilization": float(VLLM_GPU_MEMORY_UTILIZATION),
         "max_model_len": VLLM_MAX_MODEL_LEN_GLOBAL,
         "tensor_parallel_size": int(VLLM_TENSOR_PARALLEL_SIZE),
+        # A non-positive VLLM_MAX_NUM_SEQS used to mean "omit the flag"; max_num_seqs is now a real
+        # per-model setting (>= 1) and bounds KV need in budget mode, so coerce 0/invalid to 16.
+        "max_num_seqs": (int(VLLM_MAX_NUM_SEQS) if int(VLLM_MAX_NUM_SEQS) >= 1 else 16),
         "quantization": None,
         "dtype": "auto",
         "inactivity_timeout": VLLM_INACTIVITY_TIMEOUT,
@@ -619,6 +707,8 @@ def load_model_configs() -> "tuple[dict, dict]":
         validate_model_pools(configs, pools)  # fail fast on a model referencing an undeclared pool
         validate_tp_against_pools(configs, pools)  # fail fast if tensor_parallel_size > pool GPU count
         validate_colocate(configs, COLOCATE_MAX_SHARE)  # fail fast on colocate+TP; warn on high share
+        validate_budget_mode(configs, PLACEMENT_MODE)  # fail fast: budget mode needs max_model_len > 0
+        validate_extra_args_budget(configs, PLACEMENT_MODE)  # fail fast: no memory flags in extra_args
         logging.info(f"Loaded {len(configs)} model(s) from {MODELS_CONFIG_FILE}: {list(configs)}")
         if pools:
             logging.info(f"Declared GPU pools: { {p: len(u) for p, u in pools.items()} }")
@@ -631,6 +721,8 @@ def load_model_configs() -> "tuple[dict, dict]":
 
     allowed = load_allowed_models()
     configs = build_fallback_configs(allowed, builtins)
+    validate_budget_mode(configs, PLACEMENT_MODE)  # fail fast: budget mode needs max_model_len > 0
+    validate_extra_args_budget(configs, PLACEMENT_MODE)  # fail fast: no memory flags in extra_args
     logging.info(f"No model config file at '{MODELS_CONFIG_FILE}'; using ALLOWED_MODELS_JSON fallback "
                  f"({len(configs)} model(s)): {list(configs)}")
     return configs, {}
@@ -750,41 +842,77 @@ async def hf_repo_exists(repo_id: str) -> bool:
     except Exception:
         return False
 
+# Process-lifetime cache of parsed config.json by URL (a repo's config is immutable), so
+# get_model_max_len and get_model_kv_spec don't double-fetch the same file per cold start.
+_config_json_cache: "dict[str, dict | None]" = {}
+
+def _config_url_for(model_id: str, tokenizer_repo: "str | None" = None) -> "str | None":
+    """The config.json URL for a model (GGUF -> its base/tokenizer repo). None if unresolvable."""
+    if is_gguf_model(model_id):
+        path = tokenizer_repo or extract_tokenizer_from_gguf_path(model_id)
+        return f"https://huggingface.co/{path}/raw/main/config.json" if path else None
+    return f"https://huggingface.co/{model_id}/raw/main/config.json"
+
+async def _fetch_config_json(config_url: str) -> "dict | None":
+    """Fetch + cache a config.json. Returns the parsed dict, or None on any failure."""
+    if config_url in _config_json_cache:
+        return _config_json_cache[config_url]
+    cfg = None
+    try:
+        resp = await http_client.get(config_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
+        resp.raise_for_status()
+        parsed = resp.json()
+        cfg = parsed if isinstance(parsed, dict) else None
+    except Exception as e:
+        logging.warning(f"Could not fetch {config_url}: {e}")
+    _config_json_cache[config_url] = cfg
+    return cfg
+
 async def get_model_max_len(model_id: str) -> int:
     """Fetches the model's config.json from Hugging Face to find its max length."""
-    # For GGUF models, try to get config from the base model if available
-    if is_gguf_model(model_id):
-        tokenizer_path = extract_tokenizer_from_gguf_path(model_id)
-        if tokenizer_path:
-            config_url = f"https://huggingface.co/{tokenizer_path}/raw/main/config.json"
-        else:
-            # Skip max length detection for GGUF models without clear tokenizer path
-            return 0
-    else:
-        config_url = f"https://huggingface.co/{model_id}/raw/main/config.json"
-
-    try:
-        response = await http_client.get(config_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
-        response.raise_for_status()
-        config = response.json()
-        keys_to_check = ['max_position_embeddings', 'n_positions', 'model_max_length']
+    url = _config_url_for(model_id)
+    if not url:
+        return 0  # GGUF without a resolvable base repo
+    config = await _fetch_config_json(url)
+    if not isinstance(config, dict):
+        return 0
+    keys_to_check = ['max_position_embeddings', 'n_positions', 'model_max_length']
+    for key in keys_to_check:
+        if isinstance(config.get(key), int):
+            return config[key]
+    # Multimodal configs nest the LM fields under text_config.
+    text = config.get("text_config")
+    if isinstance(text, dict):
         for key in keys_to_check:
-            if key in config and isinstance(config[key], int):
-                return config[key]
-        return 0
-    except Exception as e:
-        logging.error(f"An error occurred while getting max length for {model_id}: {e}")
-        return 0
+            if isinstance(text.get(key), int):
+                return text[key]
+    return 0
 
 async def estimate_weight_bytes(model_id: str) -> "int | None":
-    """Best-effort estimate of a model's on-disk weight size in bytes, for the TP-fallback
-    decision (how many GPUs a model's weights need). Returns None when it can't be determined.
+    """Best-effort estimate of a model's on-disk weight size in bytes (quantization-aware).
 
-    Reads the safetensors shard index (one small JSON GET, same pattern as get_model_max_len);
-    that metadata already reflects quantized sizes. GGUF / non-safetensors repos return None,
-    in which case the caller degrades to the configured tensor_parallel_size."""
+    Primary: sum the sizes of all *.safetensors files from HF model metadata
+    (HfApi().model_info(files_metadata=True)) — handles single-file AND sharded repos, and gated
+    repos via the token. Fallback: the shard index's total_size (sharded only). Returns None when
+    neither works (e.g. GGUF / non-safetensors), so the caller degrades to discovery / configured tp."""
     if is_gguf_model(model_id) or '/' not in model_id or model_id.startswith(('http://', 'https://')):
         return None
+    token = HF_TOKEN if HF_TOKEN and HF_TOKEN.strip() else None
+    try:
+        info = await run_in_executor(partial(HfApi().model_info, model_id,
+                                             files_metadata=True, token=token))
+        total = 0
+        for s in (getattr(info, "siblings", None) or []):
+            name = getattr(s, "rfilename", "") or ""
+            if name.endswith(".safetensors"):
+                size = getattr(s, "size", None)
+                if size:
+                    total += int(size)
+        if total > 0:
+            return total
+    except Exception as e:
+        logging.warning(f"model_info weight sizing failed for {model_id}: {e}; trying shard index.")
+    # Fallback: shard index total_size (present only for multi-shard models).
     index_url = f"https://huggingface.co/{model_id}/raw/main/model.safetensors.index.json"
     try:
         resp = await http_client.get(index_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
@@ -795,6 +923,84 @@ async def estimate_weight_bytes(model_id: str) -> "int | None":
     except Exception as e:
         logging.warning(f"Could not estimate weight size for {model_id}: {e}")
     return None
+
+def _dtype_bytes(torch_dtype) -> int:
+    """Bytes per element for a model's KV-cache dtype, inferred from config.json's torch_dtype.
+    Defaults to 2 (float16/bfloat16). fp8/int8 KV -> 1; float32 -> 4."""
+    s = str(torch_dtype).lower()
+    if "float32" in s or "fp32" in s:
+        return 4
+    if "fp8" in s or "8bit" in s or "int8" in s or "float8" in s:
+        return 1
+    return 2
+
+def _sliding_window_spec(cfg_text: dict, num_layers: int) -> "tuple[int, int]":
+    """(sliding_window, num_sliding_layers) for a model, or (0, 0) for full attention.
+
+    Evidence order: explicit per-layer `layer_types` (most accurate) -> Gemma-style
+    `sliding_window` + `sliding_window_pattern` (every Nth layer is global/full) -> a bare
+    `sliding_window` (Mistral convention: all layers sliding)."""
+    window = cfg_text.get("sliding_window")
+    if not isinstance(window, int) or window <= 0:
+        return 0, 0
+    layer_types = cfg_text.get("layer_types")
+    if isinstance(layer_types, list) and layer_types:
+        n_sliding = sum(1 for t in layer_types if isinstance(t, str) and "sliding" in t.lower())
+        return window, n_sliding
+    pattern = cfg_text.get("sliding_window_pattern")
+    if isinstance(pattern, int) and pattern > 1:
+        n_global = num_layers // pattern          # every `pattern`-th layer is full/global
+        return window, max(0, num_layers - n_global)
+    return window, num_layers                      # bare sliding_window -> assume all layers sliding
+
+async def get_model_kv_spec(model_id: str, tokenizer_repo: "str | None" = None) -> "dict | None":
+    """Fetch the KV-cache-relevant architecture fields from a model's config.json.
+
+    Returns {num_layers, num_kv_heads, head_dim, dtype_bytes, sliding_window, num_sliding_layers}
+    or None when the config can't be fetched/parsed. Multimodal repos nest the LM fields under
+    'text_config'. Sliding-window layers need far less KV than full-attention ones."""
+    url = _config_url_for(model_id, tokenizer_repo)
+    if not url:
+        return None
+    cfg = await _fetch_config_json(url)
+    if not isinstance(cfg, dict):
+        return None
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    num_layers = text.get("num_hidden_layers")
+    n_heads = text.get("num_attention_heads")
+    n_kv = text.get("num_key_value_heads", n_heads)  # GQA -> kv heads; MHA -> all heads
+    hidden = text.get("hidden_size")
+    head_dim = text.get("head_dim") or (hidden // n_heads if (hidden and n_heads) else None)
+    if not (num_layers and n_kv and head_dim):
+        logging.warning(f"Incomplete KV spec for {model_id}: layers={num_layers}, "
+                        f"kv_heads={n_kv}, head_dim={head_dim}; falling back to discovery.")
+        return None
+    window, n_sliding = _sliding_window_spec(text, int(num_layers))
+    return {"num_layers": int(num_layers), "num_kv_heads": int(n_kv),
+            "head_dim": int(head_dim), "dtype_bytes": _dtype_bytes(text.get("torch_dtype", "float16")),
+            "sliding_window": int(window), "num_sliding_layers": int(n_sliding)}
+
+
+async def estimate_model_need_mib(model_id: str, model_cfg: ModelConfig, effective_tp: int) -> "float | None":
+    """Budget-mode per-card VRAM need (MiB) for a model = (weights + KV)/tp * factor + fixed margin.
+
+    Returns None when weights or the KV spec can't be determined (e.g. GGUF) — the caller then
+    falls back to sole-occupant discovery to measure the real footprint instead of guessing."""
+    wbytes = await estimate_weight_bytes(model_id)
+    if not wbytes:
+        return None
+    spec = await get_model_kv_spec(model_id)
+    if not spec:
+        return None
+    kv_total = placement.kv_cache_mib(
+        max_model_len=model_cfg.max_model_len, max_num_seqs=model_cfg.max_num_seqs,
+        num_layers=spec["num_layers"], num_kv_heads=spec["num_kv_heads"],
+        head_dim=spec["head_dim"], dtype_bytes=spec["dtype_bytes"],
+        sliding_window=spec.get("sliding_window", 0), num_sliding_layers=spec.get("num_sliding_layers", 0))
+    weights_mib = wbytes / (1024.0 * 1024.0)
+    return placement.estimate_need_mib(weights_mib, kv_total, effective_tp,
+                                       BUDGET_OVERHEAD_FACTOR, BUDGET_OVERHEAD_MIB)
+
 
 # Flags the gateway computes from placement (util cap, TP degree, model path). A model's
 # extra_args must NOT override these — doing so would defeat the co-location budget or the
@@ -976,9 +1182,9 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
     if model_cfg.dtype and model_cfg.dtype != "auto":
         command.extend(["--dtype", model_cfg.dtype])
 
-    # Preserved global flag (not part of the per-model schema; override via extra_args).
-    if int(VLLM_MAX_NUM_SEQS) > 0:
-        command.extend(["--max-num-seqs", VLLM_MAX_NUM_SEQS])
+    # Per-model concurrency cap. Must match the value used to estimate KV-cache need in budget mode.
+    if model_cfg.max_num_seqs and model_cfg.max_num_seqs > 0:
+        command.extend(["--max-num-seqs", str(model_cfg.max_num_seqs)])
 
     # Add gpt-oss specific optimizations for Ampere/Ada GPUs (RTX 3090, A100, etc)
     if is_gpt_oss_model(model_id):
@@ -1129,17 +1335,24 @@ async def gateway_status():
                        if guid in c.get("gpu_uuids", []) and c.get("status") == ContainerStatus.LOADING)
         residents = [c["container_name"] for c in containers.values()
                      if guid in c.get("gpu_uuids", []) and c.get("status") != ContainerStatus.STOPPING]
+        total_mib = v.get("total")
         gpus_status[guid] = {
             "pool": uuid_to_pool.get(guid),
-            "total_mib": v.get("total"),
+            "total_mib": total_mib,
             "used_mib": v.get("used"),
             "reserved_mib": reserved,
+            # Budget mode: the per-GPU cap on total gateway VRAM (None in whole_card).
+            "budget_mib": (GPU_BUDGET_FRACTION * total_mib) if (PLACEMENT_MODE == "budget" and total_mib) else None,
             "residents": residents,
         }
     model_ids = set(list(queue_counts.keys()) + [c["model_id"] for c in containers.values()])
     return {
         "total_gpu_vram_mib": TOTAL_GPU_VRAM,
+        "placement_mode": PLACEMENT_MODE,
+        "gpu_budget_fraction": GPU_BUDGET_FRACTION if PLACEMENT_MODE == "budget" else None,
         "pools": pools,
+        # Per-model need/measured/util are in active_containers (reserved_mib / vram_footprint /
+        # effective_util) and known_footprints_mib (signature-stamped measured footprints).
         "gpus": gpus_status,
         "known_footprints_mib": footprints,
         "active_containers": containers,
@@ -1188,6 +1401,7 @@ def _build_gpu_views(pool_gpus, gpus_snapshot):
     blocked = set()
     for guid in pool_gpus:
         g = gpus_snapshot.get(guid)
+        total = float(g["total"]) if g else 0.0
         on_gpu = [c for c in active_containers.values() if guid in c.gpu_uuids]
         ready = [c for c in on_gpu if c.status == ContainerStatus.READY]
         loading = [c for c in on_gpu if c.status == ContainerStatus.LOADING]
@@ -1195,20 +1409,29 @@ def _build_gpu_views(pool_gpus, gpus_snapshot):
         residents_by_gpu[guid] = ready  # eviction candidates are READY only
         candidates.append(placement.GpuView(
             uuid=guid,
-            total=float(g["total"]) if g else 0.0,
+            total=total,
             used_smi=float(g["used"]) if g else 0.0,
             reserved=sum(c.reserved_mib for c in loading),
             # READY + STOPPING footprints both still occupy the card.
             ready_footprint=sum(c.vram_footprint for c in (ready + stopping)),
+            # Budget mode caps total gateway VRAM per card; whole_card leaves it uncapped (inf).
+            budget=(GPU_BUDGET_FRACTION * total) if PLACEMENT_MODE == "budget" else math.inf,
         ))
         if any(not c.colocate for c in on_gpu):  # incl. STOPPING — its VRAM is still resident
             blocked.add(guid)
     return candidates, residents_by_gpu, blocked
 
 async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, effective_tp,
-                              effective_util, run_discovery, before_used, meas_gpu):
+                              effective_util, run_discovery, before_used, meas_gpu,
+                              signature=None):
     """Start the container for an already-inserted LOADING `entry`, then flip it READY (or drop it
-    on failure — the single cleanup site). Whole-card discovery refines the footprint after READY."""
+    on failure — the single cleanup site).
+
+    After READY the footprint is set to GROUND TRUTH: the model's actual per-process VRAM
+    (`measure_model_vram`). If attribution is unavailable (old driver / no compute-apps) the
+    sole-occupant `run_discovery` delta is used; failing that, the reserved estimate stands. The
+    result is persisted stamped with `signature` (when provided) so it's reused only in a matching
+    sizing context. `signature=None` (degraded mode) skips measurement + persistence."""
     try:
         try:
             runtime = await start_model_container(
@@ -1249,28 +1472,34 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
                 logging.error(f"Could not clean up orphaned container {entry.container_name}: {e}")
             return None
 
-        # Whole-card discovery: measure the per-GPU footprint on one chosen GPU and persist it.
-        if run_discovery and meas_gpu:
-            logging.info(f"Discovery: sampling GPU {meas_gpu} VRAM 3x over 45s...")
-            samples = []
-            for _ in range(3):
-                await asyncio.sleep(15)
-                samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
-            measured = max(samples) - before_used
-            if measured > 256:
-                logging.info(f"Measured per-GPU footprint for {target_model_id} on {meas_gpu}: {measured} MiB")
+        # Footprint = ground truth. Skip entirely in degraded mode (signature is None).
+        if signature is not None:
+            # 1) Primary: actual per-process VRAM for THIS model's container (works packed or alone).
+            measured = await measure_model_vram(entry.container_name, gpu_uuids or entry.gpu_uuids)
+            source = "compute-apps"
+            # 2) Fallback: sole-occupant whole-GPU delta (only meaningful when run_discovery / alone).
+            if measured is None and run_discovery and meas_gpu:
+                logging.info(f"compute-apps attribution unavailable; sampling GPU {meas_gpu} VRAM 3x over 45s...")
+                samples = []
+                for _ in range(3):
+                    await asyncio.sleep(15)
+                    samples.append((await get_gpu_vram()).get(meas_gpu, {}).get("used", 0.0))
+                delta = max(samples) - before_used
+                measured = delta if delta > 256 else None
+                source = "gpu-delta"
+            # 3) Last resort: keep the reserved estimate (already seeded into vram_footprint).
+            if measured is not None and measured > 256:
                 entry.vram_footprint = measured
-                known_footprints[target_model_id] = {
-                    "per_gpu_mib": float(measured), "effective_tp": effective_tp, "measured_at": time.time()}
+                footprint_mib = measured
             else:
-                # G5: unmeasurable -> persist the util*card ESTIMATE (the reservation we used), never a
-                # 0 sentinel. The model is "seen" with a sane footprint and won't re-run discovery.
-                logging.warning(f"Could not measure footprint for {target_model_id} ({measured} MiB); "
-                                f"persisting estimate {int(entry.reserved_mib)} MiB.")
-                entry.vram_footprint = entry.reserved_mib
-                known_footprints[target_model_id] = {
-                    "per_gpu_mib": float(entry.reserved_mib), "effective_tp": effective_tp, "measured_at": time.time()}
+                footprint_mib = entry.reserved_mib
+                source = (source or "") + "/estimate-fallback"
+            known_footprints[target_model_id] = {
+                "per_gpu_mib": float(footprint_mib), "effective_tp": effective_tp,
+                "effective_util": float(effective_util or 0.0), "measured_at": time.time(),
+                "signature": signature}
             await save_known_footprints_async()
+            logging.info(f"Footprint for {target_model_id}: {int(footprint_mib)} MiB (via {source}).")
         return entry
     finally:
         loading_tasks.pop(entry.container_name, None)  # release owner-liveness handle on every exit
@@ -1288,13 +1517,19 @@ async def _ensure_started(target_model_id, model_cfg):
     if ready is not None:
         return ready
 
-    record = known_footprints.get(target_model_id)          # None | {per_gpu_mib, effective_tp, measured_at}
-    is_discovery = record is None
+    # record shape: {per_gpu_mib, effective_tp, effective_util, measured_at, signature}. prior_tp is a
+    # deterministic optimization (reused regardless of signature). learned_mib / is_discovery are
+    # gated on a signature match below (once effective_tp is known) so stale / cross-context footprints
+    # are NOT reused.
+    record = known_footprints.get(target_model_id)
     prior_tp = record.get("effective_tp") if record else None
-    learned_mib = float(record.get("per_gpu_mib", 0.0)) if record else 0.0
+    raw_learned_mib = float(record.get("per_gpu_mib", 0.0)) if record else 0.0
     pool = pool_for(model_cfg)
     pool_gpus = MANAGED_POOLS.get(pool, [])
-    is_colocate = model_cfg.colocate
+    budget_mode = (PLACEMENT_MODE == "budget")
+    # Co-location is a whole_card-mode concept; in budget mode every model packs by VRAM accounting,
+    # so the colocate flag is moot and ignored.
+    is_colocate = model_cfg.colocate and not budget_mode
     util = model_cfg.gpu_memory_utilization
 
     # Degraded mode: VRAM accounting unavailable. One container at a time, but still record a
@@ -1345,8 +1580,35 @@ async def _ensure_started(target_model_id, model_cfg):
         effective_tp = placement.compute_effective_tp(wbytes, model_cfg.tensor_parallel_size,
                                                       prior_tp, pool_totals, util)
 
-    # Per-card need (F9): learned per-GPU footprint when known(>0), else util * that card's total.
-    need_fn = (lambda g: learned_mib) if learned_mib > 0 else (lambda g: util * g.total)
+    # Reuse a persisted footprint only when its signature matches the current sizing context;
+    # otherwise treat the model as unseen and re-measure (fixes cross-mode / config-change staleness).
+    current_sig = placement.footprint_signature(
+        PLACEMENT_MODE, model_cfg.max_model_len, model_cfg.max_num_seqs, effective_tp, util_basis=util)
+    seen = record is not None and placement.signature_matches(record, current_sig)
+    is_discovery = not seen
+    learned_mib = raw_learned_mib if seen else 0.0
+
+    # Per-card need.
+    #  - budget mode: weights + bounded KV + overhead, recomputed fresh from config each cold start
+    #    (so a max_model_len/max_num_seqs change takes effect). A model whose need can't be estimated
+    #    (GGUF / unknown arch) reuses a previously measured footprint, else falls back to discovery.
+    #  - whole_card mode (F9): learned per-GPU footprint when known(>0), else util * that card's total.
+    budget_need = None
+    budget_discovery = False
+    if budget_mode:
+        budget_need = await estimate_model_need_mib(target_model_id, model_cfg, effective_tp)
+        if budget_need is None:                 # GGUF / unknown arch -> can't estimate
+            if learned_mib > 0:
+                budget_need = learned_mib       # reuse a previously measured footprint
+            else:
+                budget_discovery = True         # measure as sole occupant on first load
+
+    if budget_mode and budget_need is not None:
+        need_fn = (lambda g, n=budget_need: n)              # constant per-card need
+    elif learned_mib > 0:
+        need_fn = (lambda g: learned_mib)
+    else:
+        need_fn = (lambda g: util * g.total)                # whole-card / discovery fallback
     colocate_wbytes = await estimate_weight_bytes(target_model_id) if is_colocate else None
 
     # DECIDE + reserve + insert LOADING — under state_lock (no I/O inside).
@@ -1381,6 +1643,13 @@ async def _ensure_started(target_model_id, model_cfg):
                         detail=(f"Cannot co-locate {target_model_id} on {chosen_uuids[0]}: budget "
                                 f"~{int(effective_util * total)} MiB < weights ~{int(need_mib)} MiB."))
             reserve_amt = effective_util * total
+        elif budget_mode and budget_need is not None:
+            # Size the launch util so vLLM takes ONLY this need; the budget cap makes it physically
+            # unable to exceed it, so an under-estimate fails only this model's startup, not a peer.
+            total = chosen_gv.total or max_total
+            effective_util = min(GPU_BUDGET_FRACTION,
+                                 (budget_need / total) if total > 0 else GPU_BUDGET_FRACTION)
+            reserve_amt = budget_need
         else:
             effective_util = None
             reserve_amt = need_fn(chosen_gv)
@@ -1395,14 +1664,22 @@ async def _ensure_started(target_model_id, model_cfg):
             created_at=time.time())
         active_containers[entry.container_name] = entry
         loading_tasks[entry.container_name] = asyncio.current_task()  # owner-liveness handle (G2)
-        logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', "
-                     f"{'colocate util=%.3f' % effective_util if is_colocate else 'tp=%d' % effective_tp}, "
+        if is_colocate:
+            placed_desc = 'colocate util=%.3f' % effective_util
+        elif budget_mode and effective_util is not None:
+            placed_desc = 'budget util=%.3f tp=%d' % (effective_util, effective_tp)
+        else:
+            placed_desc = 'tp=%d' % effective_tp
+        logging.info(f"Placing {target_model_id} on GPU(s) {chosen_uuids} (pool '{pool}', {placed_desc}, "
                      f"~{int(reserve_amt)} MiB/GPU); evicting {evictions or 'nothing'}; slot {entry.container_name}.")
 
     # Evict + start OUTSIDE the lock.
     for name in evictions:
         await stop_container(name)
-    run_discovery = is_discovery and not is_colocate
+    # Per-process attribution (in _start_and_finalize) is the primary footprint source. `run_discovery`
+    # marks a sole-occupant load (unseen whole_card model, or a budget model whose need couldn't be
+    # estimated) — for those the whole-GPU delta is a valid FALLBACK if attribution is unavailable.
+    run_discovery = budget_discovery if budget_mode else (is_discovery and not is_colocate)
     # G4: take the discovery baseline AFTER evictions have actually released VRAM (stop_container
     # returns before the driver frees it), not from the pre-decision snapshot. Settle by polling the
     # chosen GPU's used until it stops dropping (or a short ceiling).
@@ -1413,7 +1690,7 @@ async def _ensure_started(target_model_id, model_cfg):
     return await _start_and_finalize(
         entry, target_model_id, model_cfg, gpu_uuids=chosen_uuids, effective_tp=effective_tp,
         effective_util=effective_util, run_discovery=run_discovery,
-        before_used=before_used, meas_gpu=chosen_uuids[0])
+        before_used=before_used, meas_gpu=chosen_uuids[0], signature=current_sig)
 
 # Catch-all proxy route (must be last)
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
