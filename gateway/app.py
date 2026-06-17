@@ -683,6 +683,7 @@ def builtin_model_defaults() -> dict:
         # A non-positive VLLM_MAX_NUM_SEQS used to mean "omit the flag"; max_num_seqs is now a real
         # per-model setting (>= 1) and bounds KV need in budget mode, so coerce 0/invalid to 16.
         "max_num_seqs": (int(VLLM_MAX_NUM_SEQS) if int(VLLM_MAX_NUM_SEQS) >= 1 else 16),
+        "kv_reservation_seqs": None,  # None -> reserve KV for max_num_seqs (today's behavior)
         "quantization": None,
         "dtype": "auto",
         "inactivity_timeout": VLLM_INACTIVITY_TIMEOUT,
@@ -997,11 +998,21 @@ async def get_model_kv_spec(model_id: str, tokenizer_repo: "str | None" = None) 
             "sliding_window": int(window), "num_sliding_layers": int(n_sliding)}
 
 
+def kv_reservation_seqs(model_cfg: ModelConfig) -> int:
+    """Sequences to RESERVE KV for in budget mode: explicit kv_reservation_seqs, else max_num_seqs.
+
+    max_num_seqs is vLLM's scheduler width (launched as --max-num-seqs); kv_reservation_seqs lets you
+    reserve VRAM for FEWER concurrent sequences than that — so a model can admit many short requests
+    while packing tightly, with excess sequences queuing/paging within the reserved pool."""
+    return model_cfg.kv_reservation_seqs if model_cfg.kv_reservation_seqs else model_cfg.max_num_seqs
+
+
 async def estimate_model_need_mib(model_id: str, model_cfg: ModelConfig, effective_tp: int) -> "float | None":
     """Budget-mode per-card VRAM need (MiB) for a model = (weights + KV)/tp * factor + fixed margin.
 
-    Returns None when weights or the KV spec can't be determined (e.g. GGUF) — the caller then
-    falls back to sole-occupant discovery to measure the real footprint instead of guessing."""
+    KV is sized for kv_reservation_seqs (not the full max_num_seqs scheduler width). Returns None when
+    weights or the KV spec can't be determined (e.g. GGUF) — the caller then falls back to
+    sole-occupant discovery to measure the real footprint instead of guessing."""
     wbytes = await estimate_weight_bytes(model_id)
     if not wbytes:
         return None
@@ -1009,7 +1020,7 @@ async def estimate_model_need_mib(model_id: str, model_cfg: ModelConfig, effecti
     if not spec:
         return None
     kv_total = placement.kv_cache_mib(
-        max_model_len=model_cfg.max_model_len, max_num_seqs=model_cfg.max_num_seqs,
+        max_model_len=model_cfg.max_model_len, max_num_seqs=kv_reservation_seqs(model_cfg),
         num_layers=spec["num_layers"], num_kv_heads=spec["num_kv_heads"],
         head_dim=spec["head_dim"], dtype_bytes=spec["dtype_bytes"],
         sliding_window=spec.get("sliding_window", 0), num_sliding_layers=spec.get("num_sliding_layers", 0))
@@ -1441,7 +1452,8 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
                               effective_util, run_discovery, before_used, meas_gpu,
                               signature=None):
     """Start the container for an already-inserted LOADING `entry`, then flip it READY (or drop it
-    on failure — the single cleanup site).
+    on failure — the single cleanup site). `target_model_id` is the gateway IDENTITY (config name);
+    the vLLM `--model` is `model_cfg.repo`, so several named profiles can share one repo.
 
     After READY the footprint is set to GROUND TRUTH: the model's actual per-process VRAM
     (`measure_model_vram`). If attribution is unavailable (old driver / no compute-apps) the
@@ -1451,7 +1463,7 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
     try:
         try:
             runtime = await start_model_container(
-                target_model_id, entry.container_name, model_cfg,
+                model_cfg.repo, entry.container_name, model_cfg,
                 gpu_uuids=gpu_uuids, effective_tp=effective_tp, effective_util=effective_util)
         except BaseException:
             async with state_lock:
@@ -1592,14 +1604,15 @@ async def _ensure_started(target_model_id, model_cfg):
         wbytes = None
         if (len(pool_gpus) >= 2 and max_total > 0
                 and (max(pool_totals) - min(pool_totals)) <= 0.05 * max_total):
-            wbytes = await estimate_weight_bytes(target_model_id)
+            wbytes = await estimate_weight_bytes(model_cfg.repo)
         effective_tp = placement.compute_effective_tp(wbytes, model_cfg.tensor_parallel_size,
                                                       prior_tp, pool_totals, util)
 
     # Reuse a persisted footprint only when its signature matches the current sizing context;
     # otherwise treat the model as unseen and re-measure (fixes cross-mode / config-change staleness).
+    # Sizing depends on kv_reservation_seqs (the reserved KV), not max_num_seqs (scheduler width).
     current_sig = placement.footprint_signature(
-        PLACEMENT_MODE, model_cfg.max_model_len, model_cfg.max_num_seqs, effective_tp, util_basis=util)
+        PLACEMENT_MODE, model_cfg.max_model_len, kv_reservation_seqs(model_cfg), effective_tp, util_basis=util)
     seen = record is not None and placement.signature_matches(record, current_sig)
     is_discovery = not seen
     learned_mib = raw_learned_mib if seen else 0.0
@@ -1612,7 +1625,7 @@ async def _ensure_started(target_model_id, model_cfg):
     budget_need = None
     budget_discovery = False
     if budget_mode:
-        budget_need = await estimate_model_need_mib(target_model_id, model_cfg, effective_tp)
+        budget_need = await estimate_model_need_mib(model_cfg.repo, model_cfg, effective_tp)
         if budget_need is None:                 # GGUF / unknown arch -> can't estimate
             if learned_mib > 0:
                 budget_need = learned_mib       # reuse a previously measured footprint
@@ -1625,7 +1638,7 @@ async def _ensure_started(target_model_id, model_cfg):
         need_fn = (lambda g: learned_mib)
     else:
         need_fn = (lambda g: util * g.total)                # whole-card / discovery fallback
-    colocate_wbytes = await estimate_weight_bytes(target_model_id) if is_colocate else None
+    colocate_wbytes = await estimate_weight_bytes(model_cfg.repo) if is_colocate else None
 
     # DECIDE + reserve + insert LOADING — under state_lock (no I/O inside).
     async with state_lock:
@@ -1725,7 +1738,9 @@ async def proxy_request(request: Request):
     if not model_name or model_name not in ALLOWED_MODELS:
         return JSONResponse({"error": f"Model not allowed. Please choose from: {list(ALLOWED_MODELS.keys())}"}, status_code=400)
 
-    target_model_id = ALLOWED_MODELS[model_name]
+    # Identity is the config NAME (so several named profiles can share one repo, each its own
+    # container / footprint / queue). The repo (model_cfg.repo) is what vLLM serves under.
+    target_model_id = model_name
     model_cfg = MODEL_CONFIGS[model_name]
 
     # Initialize semaphore for this model if not exists
@@ -1829,7 +1844,7 @@ async def proxy_request(request: Request):
         current_queue_depth = model_queue_counts.get(target_model_id, 0)
 
         try:
-            body['model'] = target_model_id
+            body['model'] = model_cfg.repo  # vLLM serves under the repo it was launched with (--model)
             headers_to_forward = {
                 k: v for k, v in request.headers.items()
                 if k.lower() not in ('host', 'connection', 'content-length', 'transfer-encoding')

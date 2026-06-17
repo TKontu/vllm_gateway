@@ -247,6 +247,43 @@ models:
   gemma:   { repo: cyankiwi/gemma-4-E4B-it-AWQ-INT4, quantization: awq, max_model_len: 32768 }
 ```
 
+#### Concurrency vs. packing: `kv_reservation_seqs`
+
+`max_num_seqs` is vLLM's scheduler width *and*, by default, the amount of KV the gateway reserves
+(`max_model_len × max_num_seqs`). For a model that takes **many short requests**, reserving for the full
+worst-case concurrency wastes VRAM. Set **`kv_reservation_seqs`** below `max_num_seqs` to reserve KV for
+fewer sequences while still admitting the full width — extra requests queue/page within the reserved
+pool instead of demanding proportional VRAM:
+
+```yaml
+judge-fast:
+  repo: cyankiwi/Qwen3.5-4B-AWQ-4bit
+  max_model_len: 8192
+  max_num_seqs: 32          # admit up to 32 concurrent
+  kv_reservation_seqs: 4    # but only reserve KV for 4 -> packs like a 4-way model
+```
+
+This works because the requests are short: 4 sequences' worth of KV blocks holds far more than 4 short
+requests. Caveats: it does **not** guarantee 32-way at long context (you still only fit ~4 long ones,
+the rest defer); the pool is static; and it's a tuning dial (over-reserve → packs poorly, under-reserve →
+queuing) — but never an OOM (the util cap holds). Leave it unset for the default (= `max_num_seqs`).
+
+#### Multiple profiles of one model
+
+Model identity is the **config name**, not the repo, so you can register one repo under several names
+with different launch profiles and have your application route to the right one — e.g. a
+short-context/high-concurrency profile for burst work and a long-context profile for big jobs (you can't
+change `max_model_len` per request, so this genuinely needs two launches):
+
+```yaml
+coder-short: { repo: Qwen/Qwen2.5-Coder-7B-Instruct, max_model_len: 8192,  max_num_seqs: 16, kv_reservation_seqs: 4 }
+coder-long:  { repo: Qwen/Qwen2.5-Coder-7B-Instruct, max_model_len: 32768, max_num_seqs: 1 }
+```
+
+Each name is an independent model (own container, footprint, queue). **Caveat:** if both are resident at
+once the weights occupy VRAM **twice**; otherwise the gateway swaps between them (a reload on switch). Best
+when used in batches rather than interleaved request-by-request.
+
 ### `whole_card`
 
 The legacy behavior: each model fills its card at its own `gpu_memory_utilization`, and the gateway

@@ -23,6 +23,7 @@ BUILTINS = {
     "max_model_len": 0,
     "tensor_parallel_size": 1,
     "max_num_seqs": 16,
+    "kv_reservation_seqs": None,
     "quantization": None,
     "dtype": "auto",
     "inactivity_timeout": 1800,
@@ -332,6 +333,32 @@ def test_validate_budget_mode():
     # whole_card mode: no requirement, both pass.
     validate_budget_mode(unbounded, "whole_card")
     print("ok: validate_budget_mode")
+
+
+def test_kv_reservation_seqs():
+    cfgs = resolve_model_configs({"models": {
+        "a": {"repo": "o/a", "max_num_seqs": 32, "kv_reservation_seqs": 4},
+        "b": {"repo": "o/b"},  # unset -> None (falls back to max_num_seqs at runtime)
+    }}, BUILTINS)
+    assert cfgs["a"].kv_reservation_seqs == 4 and cfgs["a"].max_num_seqs == 32
+    assert cfgs["b"].kv_reservation_seqs is None
+    # null is explicitly allowed; <1 and bool are rejected
+    assert resolve_model_configs({"models": {"m": {"repo": "o/m", "kv_reservation_seqs": None}}},
+                                 BUILTINS)["m"].kv_reservation_seqs is None
+    _expect_error({"models": {"m": {"repo": "o/m", "kv_reservation_seqs": 0}}}, "kv_reservation_seqs")
+    _expect_error({"models": {"m": {"repo": "o/m", "kv_reservation_seqs": True}}}, "kv_reservation_seqs")
+    print("ok: kv_reservation_seqs")
+
+
+def test_same_repo_multiple_profiles():
+    # Two named profiles may share one repo (distinct identities, distinct configs).
+    cfgs = resolve_model_configs({"defaults": {"max_model_len": 8192}, "models": {
+        "fast": {"repo": "org/m", "max_num_seqs": 32, "kv_reservation_seqs": 4},
+        "long": {"repo": "org/m", "max_num_seqs": 2, "max_model_len": 32768},
+    }}, BUILTINS)
+    assert cfgs["fast"].repo == cfgs["long"].repo == "org/m"
+    assert cfgs["fast"].max_model_len == 8192 and cfgs["long"].max_model_len == 32768
+    print("ok: same repo, multiple profiles")
 
 
 def test_validate_extra_args_budget():
