@@ -32,6 +32,12 @@ services:
       BUDGET_OVERHEAD_FACTOR: ${BUDGET_OVERHEAD_FACTOR:-1.1}
       BUDGET_OVERHEAD_MIB: ${BUDGET_OVERHEAD_MIB:-1024}
 
+      # --- QUEUEING (per model) ---
+      # Max concurrent requests forwarded to each model's vLLM, and max requests queued before
+      # the gateway returns 429. (KV-cache capacity still bounds true concurrency — see README.)
+      GATEWAY_MAX_CONCURRENT: ${GATEWAY_MAX_CONCURRENT:-50}
+      GATEWAY_MAX_QUEUE_SIZE: ${GATEWAY_MAX_QUEUE_SIZE:-200}
+
       # --- GPU PINNING / POOLS ---
       # For multi-GPU, declare a 'pools:' section in models.yaml (one gateway manages
       # several GPUs and places each model on a GPU in its pool). For a single GPU, leave
