@@ -831,13 +831,22 @@ async def stop_container(container_name: str, drain_timeout: float = 30.0):
         async with state_lock:
             active_containers.pop(container_name, None)
 
+def _hf_auth_headers() -> dict:
+    """Authorization header for huggingface.co requests when a token is configured.
+
+    Gated repos (e.g. google/gemma-*) return 401 on even raw config.json without auth, which would
+    make the KV-spec / max-len lookups silently fail and the model fall back to whole-card discovery.
+    The token is accepted (and ignored) on public repos, so it's always safe to send."""
+    tok = HF_TOKEN if HF_TOKEN and HF_TOKEN.strip() else None
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
 async def hf_repo_exists(repo_id: str) -> bool:
     """Return True if repo_id has a readable config.json on HuggingFace."""
     if not repo_id:
         return False
     url = f"https://huggingface.co/{repo_id}/raw/main/config.json"
     try:
-        resp = await http_client.get(url, timeout=5)
+        resp = await http_client.get(url, timeout=5, headers=_hf_auth_headers())
         return resp.status_code == 200
     except Exception:
         return False
@@ -859,7 +868,8 @@ async def _fetch_config_json(config_url: str) -> "dict | None":
         return _config_json_cache[config_url]
     cfg = None
     try:
-        resp = await http_client.get(config_url, follow_redirects=True, timeout=httpx.Timeout(10.0))
+        resp = await http_client.get(config_url, follow_redirects=True, timeout=httpx.Timeout(10.0),
+                                     headers=_hf_auth_headers())
         resp.raise_for_status()
         parsed = resp.json()
         cfg = parsed if isinstance(parsed, dict) else None
