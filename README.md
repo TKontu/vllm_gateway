@@ -198,6 +198,65 @@ models:
   through this swapping gateway. The gateway's `util` pool can still place small models on the same
   A2000 because it reads the card's real free VRAM. See `/gateway/status` for per-GPU pool/usage/residents.
 
+## Placement modes
+
+`PLACEMENT_MODE` controls how the gateway fits models onto a card.
+
+### `budget` (default)
+
+`GPU_BUDGET_FRACTION` becomes a **per-GPU total cap** (fraction of each card the gateway may fill
+across *all* its models). Each model is launched sized to **only what it needs** — its weights plus
+the KV cache for its `max_model_len` × `max_num_seqs`, plus a safety cushion — and the gateway packs
+**multiple models onto one card** until the budget is full. When the budget can't fit a new model it
+evicts idle models LRU, or returns **503** rather than over-commit.
+
+Why this is safe: `--gpu-memory-utilization` is a hard fraction of total card memory, so launching a
+model at `util = need / card_total` makes it **physically unable** to exceed its budgeted share. An
+under-estimate can therefore only fail *that* model's own startup — it can never OOM a co-resident.
+Estimates are biased generous via `BUDGET_OVERHEAD_FACTOR` / `BUDGET_OVERHEAD_MIB`.
+
+**Ground-truth accounting.** The sizing estimate (weights from HF metadata + sliding-window-aware KV)
+only picks the launch util. After a model is READY the gateway measures its **actual** per-process
+VRAM (`nvidia-smi` compute-apps attributed to the container) and uses *that* as the footprint for
+placement math — so the gateway's view always matches reality, including the effects of quantization,
+sliding-window attention, and KV dtype. Each footprint is stamped with a **signature**
+(mode + `max_model_len` + `max_num_seqs` + tensor-parallel + util basis) and is reused only when that
+signature matches — so a mode switch or a config change **re-measures automatically** instead of
+trusting a stale value.
+
+**Restrictions in budget mode.** Memory-affecting flags must be set via the structured keys, not
+`extra_args`: `--max-model-len`, `--max-num-seqs`, `--kv-cache-dtype`, `--gpu-memory-utilization` in
+`extra_args` are rejected at startup (they would diverge from the gateway's sizing). Models the gateway
+can't auto-size (GGUF, or no readable HF config) load **alone once** at their per-model
+`gpu_memory_utilization`, are measured, then pack at that measured size on later requests — so set that
+value to the share you want such a model to take.
+
+**Requirement:** every model must set `max_model_len > 0` (and ideally a modest `max_num_seqs`),
+because vLLM's KV-cache need is otherwise unbounded. The gateway **fails fast at startup** if a model
+omits it. The `colocate` flag is ignored in this mode (packing is universal).
+
+**Tradeoff:** a lone model is sized to its need and leaves the rest of the card idle (so others can
+join). That caps single-model peak throughput (smaller KV pool) in exchange for density. If you run
+one model at a time and want maximum throughput, use `whole_card`.
+
+```yaml
+# config/models.yaml — two models share one 24 GB card under budget mode
+defaults: { pool: llm, max_num_seqs: 8 }
+models:
+  qwen9b:  { repo: cyankiwi/Qwen3.5-9B-AWQ-4bit,    quantization: awq, max_model_len: 32768 }
+  gemma:   { repo: cyankiwi/gemma-4-E4B-it-AWQ-INT4, quantization: awq, max_model_len: 32768 }
+```
+
+### `whole_card`
+
+The legacy behavior: each model fills its card at its own `gpu_memory_utilization`, and the gateway
+swaps models via LRU eviction when a different model is requested. `colocate: true` lets small models
+share a card here. No `max_model_len` requirement. Set `PLACEMENT_MODE=whole_card` to keep this.
+
+> **Upgrade note:** the default changed to `budget`. A deployment using the legacy
+> `ALLOWED_MODELS_JSON` (no per-model `max_model_len`) will now refuse to start until you either set
+> `max_model_len` per model (via `models.yaml`) or set `PLACEMENT_MODE=whole_card`.
+
 ## Configuration
 
 All configuration is done via environment variables, making it easy to deploy with Portainer, Kubernetes, or directly from GitHub.
@@ -234,6 +293,15 @@ The `.env` file will be automatically loaded by Docker Compose.
 | `VLLM_MAX_NUM_SEQS` | `16` | Maximum concurrent sequences |
 | `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of GPUs to split model across |
 | `VLLM_PORT` | `8000` | Internal port used by vLLM containers |
+
+#### Placement Settings
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PLACEMENT_MODE` | `budget` | `budget` (pack many models per card under a cap) or `whole_card` (legacy LRU swap). See [Placement modes](#placement-modes). |
+| `GPU_BUDGET_FRACTION` | `VLLM_GPU_MEMORY_UTILIZATION` | Per-GPU total VRAM cap (fraction) the gateway may fill across all its models in `budget` mode |
+| `BUDGET_OVERHEAD_FACTOR` | `1.1` | Multiplier on (weights + KV) when estimating a model's need |
+| `BUDGET_OVERHEAD_MIB` | `1024` | Fixed per-card margin (MiB) added to each model's need estimate |
 
 #### Networking Settings
 

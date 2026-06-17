@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 from config_loader import (  # noqa: E402
     resolve_model_configs, build_fallback_configs, resolve_pools,
     validate_model_pools, validate_tp_against_pools, validate_colocate,
-    validate_pools_visible, migrate_footprints,
+    validate_pools_visible, validate_budget_mode, validate_extra_args_budget, migrate_footprints,
 )
 
 # Mirrors app.builtin_model_defaults() with stock env-var defaults.
@@ -22,6 +22,7 @@ BUILTINS = {
     "gpu_memory_utilization": 0.90,
     "max_model_len": 0,
     "tensor_parallel_size": 1,
+    "max_num_seqs": 16,
     "quantization": None,
     "dtype": "auto",
     "inactivity_timeout": 1800,
@@ -283,12 +284,89 @@ def test_migrate_footprints():
         "org/c": 0,                                                  # legacy sentinel
         "org/bad": "nonsense",                                       # corrupt -> dropped
     })
-    assert out["org/a"] == {"per_gpu_mib": 20000.0, "effective_tp": 1, "measured_at": 0.0}
+    assert out["org/a"] == {"per_gpu_mib": 20000.0, "effective_tp": 1,
+                            "effective_util": 0.0, "measured_at": 0.0, "signature": {}}
     assert out["org/b"]["effective_tp"] == 2 and out["org/b"]["per_gpu_mib"] == 13000.0
-    assert out["org/c"] == {"per_gpu_mib": 0.0, "effective_tp": 1, "measured_at": 0.0}
+    assert out["org/b"]["effective_util"] == 0.0  # absent in old new-shape record -> defaulted
+    assert out["org/b"]["signature"] == {}        # legacy record -> empty signature (never reused)
+    assert out["org/c"] == {"per_gpu_mib": 0.0, "effective_tp": 1,
+                            "effective_util": 0.0, "measured_at": 0.0, "signature": {}}
     assert "org/bad" not in out
     assert migrate_footprints({}) == {} and migrate_footprints(None) == {}
     print("ok: migrate_footprints")
+
+
+def test_max_num_seqs_precedence_and_validation():
+    raw = {
+        "defaults": {"max_num_seqs": 32},
+        "models": {
+            "a": {"repo": "org/a", "max_num_seqs": 4},   # per-model wins
+            "b": {"repo": "org/b"},                        # inherits defaults
+            "c": {"repo": "org/c"},
+        },
+    }
+    cfgs = resolve_model_configs(raw, BUILTINS)
+    assert cfgs["a"].max_num_seqs == 4
+    assert cfgs["b"].max_num_seqs == 32
+    # builtin fallback when neither sets it
+    cfgs2 = resolve_model_configs({"models": {"m": {"repo": "o/r"}}}, BUILTINS)
+    assert cfgs2["m"].max_num_seqs == BUILTINS["max_num_seqs"]
+    # type/range validation
+    _expect_error({"models": {"m": {"repo": "o/r", "max_num_seqs": 0}}}, "max_num_seqs")
+    _expect_error({"models": {"m": {"repo": "o/r", "max_num_seqs": True}}}, "max_num_seqs")
+    print("ok: max_num_seqs precedence + validation")
+
+
+def test_validate_budget_mode():
+    bounded = resolve_model_configs(
+        {"defaults": {"max_model_len": 8192}, "models": {"m": {"repo": "o/r"}}}, BUILTINS)
+    unbounded = resolve_model_configs({"models": {"m": {"repo": "o/r"}}}, BUILTINS)  # max_model_len 0
+    # budget mode: bounded passes, unbounded fails fast naming the offending model.
+    validate_budget_mode(bounded, "budget")          # no raise
+    try:
+        validate_budget_mode(unbounded, "budget")
+    except ValueError as e:
+        assert "max_model_len" in str(e) and "'m'" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for unbounded model in budget mode")
+    # whole_card mode: no requirement, both pass.
+    validate_budget_mode(unbounded, "whole_card")
+    print("ok: validate_budget_mode")
+
+
+def test_validate_extra_args_budget():
+    raw = {
+        "defaults": {"max_model_len": 8192},
+        "models": {
+            "ok": {"repo": "o/ok", "extra_args": ["--enable-prefix-caching"]},
+            "bad": {"repo": "o/bad", "extra_args": ["--max-model-len", "65536"]},
+        },
+    }
+    cfgs = resolve_model_configs(raw, BUILTINS)
+    # budget mode: a memory-affecting flag in extra_args is rejected, naming the model.
+    try:
+        validate_extra_args_budget(cfgs, "budget")
+    except ValueError as e:
+        assert "bad" in str(e) and "extra_args" in str(e), e
+    else:
+        raise AssertionError("expected ValueError for --max-model-len in extra_args (budget)")
+    # The '=' form is caught too.
+    cfgs2 = resolve_model_configs(
+        {"defaults": {"max_model_len": 8192},
+         "models": {"m": {"repo": "o/m", "extra_args": ["--kv-cache-dtype=fp8"]}}}, BUILTINS)
+    try:
+        validate_extra_args_budget(cfgs2, "budget")
+        raise AssertionError("expected ValueError for --kv-cache-dtype= in extra_args")
+    except ValueError:
+        pass
+    # whole_card mode: no restriction.
+    validate_extra_args_budget(cfgs, "whole_card")
+    # A model with only harmless extra_args passes in budget mode.
+    cfgs3 = resolve_model_configs(
+        {"defaults": {"max_model_len": 8192},
+         "models": {"m": {"repo": "o/m", "extra_args": ["--enable-prefix-caching"]}}}, BUILTINS)
+    validate_extra_args_budget(cfgs3, "budget")
+    print("ok: validate_extra_args_budget")
 
 
 if __name__ == "__main__":

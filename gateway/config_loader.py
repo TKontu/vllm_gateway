@@ -16,6 +16,7 @@ ALLOWED_CONFIG_KEYS = {
     "gpu_memory_utilization",
     "max_model_len",
     "tensor_parallel_size",
+    "max_num_seqs",  # max concurrent sequences (vLLM --max-num-seqs); bounds KV-cache need in budget mode
     "quantization",
     "dtype",
     "inactivity_timeout",
@@ -39,6 +40,7 @@ class ModelConfig:
     gpu_memory_utilization: float
     max_model_len: int
     tensor_parallel_size: int
+    max_num_seqs: int
     quantization: Optional[str]
     dtype: str
     inactivity_timeout: int
@@ -72,6 +74,10 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
     tensor_parallel_size = _require_int("tensor_parallel_size", name, merged["tensor_parallel_size"])
     if tensor_parallel_size < 1:
         raise ValueError(f"model '{name}': 'tensor_parallel_size' must be >= 1, got {tensor_parallel_size}")
+
+    max_num_seqs = _require_int("max_num_seqs", name, merged["max_num_seqs"])
+    if max_num_seqs < 1:
+        raise ValueError(f"model '{name}': 'max_num_seqs' must be >= 1, got {max_num_seqs}")
 
     inactivity_timeout = _require_int("inactivity_timeout", name, merged["inactivity_timeout"])
     if inactivity_timeout < 0:
@@ -107,6 +113,7 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
         gpu_memory_utilization=gmu,
         max_model_len=int(max_model_len),
         tensor_parallel_size=int(tensor_parallel_size),
+        max_num_seqs=int(max_num_seqs),
         quantization=quantization,
         dtype=dtype,
         inactivity_timeout=int(inactivity_timeout),
@@ -258,26 +265,81 @@ def validate_tp_against_pools(configs: "dict[str, ModelConfig]", pools: "dict[st
                 )
 
 
+def validate_budget_mode(configs: "dict[str, ModelConfig]", mode: str) -> None:
+    """In budget placement mode, every model needs a bounded context (max_model_len > 0).
+
+    vLLM fills its KV cache to whatever room it is given, so a model's VRAM need is only finite
+    once max_model_len (and max_num_seqs) bound the KV cache. Without that bound the gateway can't
+    size the model and pack the card, so we fail fast with an actionable message instead of silently
+    over-reserving. No-op in whole_card mode.
+    """
+    if mode != "budget":
+        return
+    bad = sorted(name for name, cfg in configs.items() if cfg.max_model_len <= 0)
+    if bad:
+        raise ValueError(
+            "PLACEMENT_MODE=budget requires max_model_len > 0 for every model (KV-cache need is "
+            f"otherwise unbounded). Models missing it: {bad}. Set 'max_model_len' per model or in the "
+            "'defaults' block, or set PLACEMENT_MODE=whole_card."
+        )
+
+
+# Memory-affecting vLLM flags that, in budget mode, must come from the structured config keys
+# (max_model_len / max_num_seqs) rather than extra_args — otherwise the launched config would diverge
+# from the size the gateway computes. --gpu-memory-utilization is already gateway-managed.
+BUDGET_FORBIDDEN_EXTRA_FLAGS = {
+    "--max-model-len", "--max-num-seqs", "--kv-cache-dtype", "--gpu-memory-utilization",
+}
+
+
+def validate_extra_args_budget(configs: "dict[str, ModelConfig]", mode: str) -> None:
+    """In budget mode, reject memory-affecting flags in extra_args (fail fast, actionable message).
+
+    Such flags would change the model's real VRAM use without changing the gateway's sizing, so the
+    first-load launch util could be wrong. No-op in whole_card mode.
+    """
+    if mode != "budget":
+        return
+    offenders = {}
+    for name, cfg in configs.items():
+        bad = [a for a in cfg.extra_args if str(a).split("=", 1)[0] in BUDGET_FORBIDDEN_EXTRA_FLAGS]
+        if bad:
+            offenders[name] = bad
+    if offenders:
+        raise ValueError(
+            "PLACEMENT_MODE=budget: memory-affecting flags must be set via the structured config keys "
+            f"(max_model_len / max_num_seqs), not extra_args. Offending models: {offenders}. They would "
+            "diverge from the gateway's sizing — move them to the model config or use PLACEMENT_MODE=whole_card."
+        )
+
+
 def migrate_footprints(raw: dict) -> dict:
     """Normalize the footprints file to the per-model record shape.
 
-    New shape: {repo: {"per_gpu_mib": float, "effective_tp": int, "measured_at": float}}.
-    Legacy shape was {repo: number} (a per-GPU footprint measured at tp=1; 0 = unmeasurable
-    sentinel). Migrate legacy scalar values forward (assume tp=1). Records already in the new
-    shape pass through. Unparseable entries are dropped.
+    New shape: {repo: {"per_gpu_mib": float, "effective_tp": int, "effective_util": float,
+    "measured_at": float}}. Legacy shape was {repo: number} (a per-GPU footprint measured at tp=1;
+    0 = unmeasurable sentinel). Migrate legacy scalar values forward (assume tp=1). Records already
+    in the new shape pass through (effective_util defaults to 0.0 for pre-budget-mode records).
+    Unparseable entries are dropped.
     """
     out = {}
     if not isinstance(raw, dict):
         return out
     for repo, val in raw.items():
         if isinstance(val, dict) and "per_gpu_mib" in val:
+            sig = val.get("signature")
             out[repo] = {
                 "per_gpu_mib": float(val.get("per_gpu_mib", 0.0)),
                 "effective_tp": int(val.get("effective_tp", 1) or 1),
+                "effective_util": float(val.get("effective_util", 0.0)),
                 "measured_at": float(val.get("measured_at", 0.0)),
+                # Carry the sizing signature forward; legacy records (no signature) get {} and are
+                # therefore never reused (treated as unseen -> re-measured). See placement.signature_matches.
+                "signature": sig if isinstance(sig, dict) else {},
             }
         elif isinstance(val, (int, float)) and not isinstance(val, bool):
-            out[repo] = {"per_gpu_mib": float(val), "effective_tp": 1, "measured_at": 0.0}
+            out[repo] = {"per_gpu_mib": float(val), "effective_tp": 1,
+                         "effective_util": 0.0, "measured_at": 0.0, "signature": {}}
         # anything else: drop (corrupt entry)
     return out
 

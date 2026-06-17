@@ -24,10 +24,20 @@ class GpuView:
     used_smi: float = 0.0
     reserved: float = 0.0
     ready_footprint: float = 0.0
+    # Per-GPU cap on the TOTAL VRAM this gateway may fill across ALL its models on this card
+    # (budget placement mode). math.inf = uncapped, i.e. the legacy whole-card behavior is unchanged.
+    budget: float = math.inf
 
     @property
     def free(self) -> float:
-        return self.total - max(self.used_smi, self.ready_footprint) - self.reserved
+        physical_free = self.total - max(self.used_smi, self.ready_footprint) - self.reserved
+        if math.isinf(self.budget):
+            return physical_free
+        # In budget mode also cap by the gateway's own remaining budget. External (non-gateway)
+        # VRAM is still respected through used_smi in physical_free; the budget caps only OUR models.
+        gateway_used = self.ready_footprint + self.reserved
+        budget_free = self.budget - gateway_used
+        return min(physical_free, budget_free)
 
 
 def _evictable_lru(residents, now, min_resident_seconds, allow_fresh):
@@ -145,6 +155,95 @@ def minimal_tp_to_fit(weight_bytes, card_total_mib, util, overhead=1.2, pool_siz
     if pool_size is not None:
         tp = min(tp, pool_size)
     return tp
+
+
+def kv_cache_mib(max_model_len, max_num_seqs, num_layers, num_kv_heads, head_dim, dtype_bytes,
+                 sliding_window=0, num_sliding_layers=0) -> float:
+    """Estimated TOTAL KV-cache size (MiB) for a model held resident at the given context/concurrency.
+
+    Per (full-attention) layer a sequence needs `max_model_len` tokens of KV; a sliding-window layer
+    only needs `min(sliding_window, max_model_len)` (Gemma 3, Mistral interleave these). So:
+        token-layers/seq = full_layers * L + sliding_layers * min(window, L)        (L = max_model_len)
+        KV bytes = 2 (key+value) * num_kv_heads * head_dim * dtype_bytes * token-layers/seq * seqs
+    With `sliding_window<=0` or `num_sliding_layers<=0` every layer is full (legacy behavior). This is
+    the whole-model KV; under tensor parallel the caller divides by tp. Returns 0.0 if any core input
+    is non-positive (unknown -> caller falls back to discovery).
+    """
+    vals = (max_model_len, max_num_seqs, num_layers, num_kv_heads, head_dim, dtype_bytes)
+    if any((v is None or v <= 0) for v in vals):
+        return 0.0
+    if sliding_window and sliding_window > 0 and num_sliding_layers and num_sliding_layers > 0:
+        sliding = min(int(num_sliding_layers), int(num_layers))
+        full = int(num_layers) - sliding
+        eff_sliding_len = min(int(sliding_window), int(max_model_len))
+    else:
+        full, sliding, eff_sliding_len = int(num_layers), 0, 0
+    token_layers_per_seq = full * int(max_model_len) + sliding * eff_sliding_len
+    total_bytes = 2 * int(num_kv_heads) * int(head_dim) * int(dtype_bytes) \
+        * token_layers_per_seq * int(max_num_seqs)
+    return float(total_bytes) / (1024.0 * 1024.0)
+
+
+# Canonical keys of a footprint "signature" — the inputs that determine a model's measured size.
+# A persisted footprint is reused only when its stored signature matches the current request's, so a
+# mode switch or a config change (context length / concurrency / TP / util basis) forces re-measure.
+_SIGNATURE_KEYS = ("mode", "max_model_len", "max_num_seqs", "effective_tp", "util_basis")
+
+
+def footprint_signature(mode, max_model_len, max_num_seqs, effective_tp, util_basis=0.0) -> dict:
+    """Build the signature stamped onto a footprint record (and compared on reuse)."""
+    return {
+        "mode": mode,
+        "max_model_len": int(max_model_len),
+        "max_num_seqs": int(max_num_seqs),
+        "effective_tp": int(effective_tp),
+        "util_basis": round(float(util_basis), 4),
+    }
+
+
+def signature_matches(record, sig) -> bool:
+    """True iff `record` carries a signature equal to `sig` across all canonical keys.
+
+    Legacy records (no signature, or `{}`) never match -> they are treated as unseen and re-measured,
+    which is the safe default after a schema/behavior change."""
+    stored = record.get("signature") if isinstance(record, dict) else None
+    if not isinstance(stored, dict) or not stored:
+        return False
+    return all(stored.get(k) == sig.get(k) for k in _SIGNATURE_KEYS)
+
+
+def attribute_vram(compute_app_rows, host_pids, gpu_uuids) -> float:
+    """Sum the GPU memory (MiB) of compute processes that belong to `host_pids` on `gpu_uuids`.
+
+    `compute_app_rows`: iterable of (gpu_uuid, pid, used_mib) from
+    `nvidia-smi --query-compute-apps`. Sums across all of a model's `gpu_uuids` (so a tensor-parallel
+    model's footprint is its total across cards). Returns 0.0 when nothing matches — the caller treats
+    that as "attribution unavailable" and falls back to delta measurement.
+    """
+    pids = {int(p) for p in host_pids}
+    uuids = set(gpu_uuids)
+    total = 0.0
+    for row in compute_app_rows:
+        try:
+            guid, pid, mib = row
+            if int(pid) in pids and guid in uuids:
+                total += float(mib)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def estimate_need_mib(weights_mib, kv_mib_total, tp, overhead_factor, fixed_overhead_mib) -> float:
+    """Per-card VRAM need (MiB) for a model in budget mode.
+
+    Weights and KV both shard across `tp` cards; the result is scaled by `overhead_factor`
+    (activations / fragmentation) and a per-card `fixed_overhead_mib` (CUDA context, cudagraphs)
+    that does NOT shard. Bias these generous: the launch util cap makes vLLM physically unable to
+    exceed this, so an under-estimate only fails THIS model's own startup, never a co-resident.
+    """
+    tp = max(1, int(tp or 1))
+    shardable = (max(0.0, weights_mib) + max(0.0, kv_mib_total)) / tp
+    return shardable * overhead_factor + fixed_overhead_mib
 
 
 def _gpu_fit_cost(g, residents, needed, now, min_resident_seconds):

@@ -7,6 +7,26 @@
 #
 # Resolution precedence per setting:
 #   per-model entry  >  defaults block  >  built-in default (the old env var)
+#
+# --- Placement mode (PLACEMENT_MODE env var) -------------------------------
+# 'budget' (DEFAULT): treat GPU_BUDGET_FRACTION as a per-GPU TOTAL cap and size each
+#   model to ONLY what it needs (weights + KV for its max_model_len x max_num_seqs +
+#   overhead), packing MANY models per card until the budget is full. In this mode
+#   EVERY model MUST set max_model_len > 0 (the gateway fails fast otherwise, because
+#   vLLM's KV-cache need is unbounded without it). The 'colocate' flag is ignored
+#   (packing is universal). Tune each model's max_num_seqs to bound its KV footprint.
+#   - After a model loads, the gateway records its ACTUAL VRAM (per-process measurement)
+#     as the footprint, so accounting is ground-truth. The footprint is stamped with a
+#     signature (mode + max_model_len + max_num_seqs + tp + util) and re-measured whenever
+#     you change any of those — no stale sizing after a config edit.
+#   - Memory-affecting flags must come from the structured keys (max_model_len,
+#     max_num_seqs), NOT extra_args: --max-model-len / --max-num-seqs / --kv-cache-dtype /
+#     --gpu-memory-utilization in extra_args are rejected at startup in budget mode.
+#   - Un-estimable models (GGUF, or no readable HF config) can't be auto-sized: they load
+#     ALONE once at their per-model gpu_memory_utilization, are measured, then pack at that
+#     measured size. So for those, set gpu_memory_utilization to the share you want them to take.
+# 'whole_card': legacy behavior — one model fills its card at gpu_memory_utilization
+#   and the gateway swaps models via LRU eviction. 'colocate' applies here.
 
 # --- GPU pools (optional, multi-GPU) ---------------------------------------
 # Declare the GPUs this gateway manages and group them into named pools. Get the
@@ -34,8 +54,10 @@ pools:
 
 defaults:                      # optional; applied to every model unless overridden
   pool: llm                    # default pool for models that don't set one
-  gpu_memory_utilization: 0.90 # 0 < x <= 1
-  max_model_len: 0             # 0 = use the model's native max (omit the flag)
+  gpu_memory_utilization: 0.90 # whole_card mode: per-model card share. budget mode: unused for
+                               # sizing (GPU_BUDGET_FRACTION is the cap); still the discovery util.
+  max_model_len: 0             # 0 = native max (whole_card). budget mode REQUIRES > 0 per model.
+  max_num_seqs: 16             # max concurrent sequences (--max-num-seqs); bounds KV need in budget mode
   tensor_parallel_size: 1
   quantization: null           # awq | gptq | fp8 | null
   dtype: auto                  # auto | float16 | bfloat16 | ...
@@ -83,6 +105,24 @@ models:                        # required, non-empty
     pool: llm
     colocate: true
     gpu_memory_utilization: 0.45
+
+  # --- Budget-mode packing (PLACEMENT_MODE=budget) -------------------------
+  # These two pack onto ONE 24 GB 3090 at the same time. Each is sized to weights + the KV
+  # for its (max_model_len x max_num_seqs) + overhead; the gateway adds them up and keeps the
+  # total under GPU_BUDGET_FRACTION x 24 GB. No colocate flag needed — packing is automatic.
+  # Keep max_model_len / max_num_seqs modest to fit more models per card.
+  packed-9b-awq:
+    repo: cyankiwi/Qwen3.5-9B-AWQ-4bit
+    quantization: awq
+    pool: llm
+    max_model_len: 32768
+    max_num_seqs: 8
+  packed-gemma-e4b:
+    repo: cyankiwi/gemma-4-E4B-it-AWQ-INT4
+    quantization: awq
+    pool: llm
+    max_model_len: 32768
+    max_num_seqs: 8
 
   # A large model forced across both 3090s with tensor parallel. tensor_parallel_size must
   # not exceed the GPUs declared in the pool (validated at startup), and the pool must be

@@ -23,6 +23,15 @@ services:
       # Path to the per-model config (mounted read-only at /app/config below).
       MODELS_CONFIG_FILE: ${MODELS_CONFIG_FILE:-/app/config/models.yaml}
 
+      # --- PLACEMENT ---
+      # budget (default): GPU_BUDGET_FRACTION is a per-GPU TOTAL cap; each model is sized to only
+      #   what it needs and many models pack per card. Requires max_model_len > 0 for every model.
+      # whole_card: legacy one-model-per-card with LRU swap. See config/models.yaml.example.
+      PLACEMENT_MODE: ${PLACEMENT_MODE:-budget}
+      GPU_BUDGET_FRACTION: ${GPU_BUDGET_FRACTION:-0.90}
+      BUDGET_OVERHEAD_FACTOR: ${BUDGET_OVERHEAD_FACTOR:-1.1}
+      BUDGET_OVERHEAD_MIB: ${BUDGET_OVERHEAD_MIB:-1024}
+
       # --- GPU PINNING / POOLS ---
       # For multi-GPU, declare a 'pools:' section in models.yaml (one gateway manages
       # several GPUs and places each model on a GPU in its pool). For a single GPU, leave
