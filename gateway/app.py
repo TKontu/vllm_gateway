@@ -299,20 +299,25 @@ async def run_in_executor(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, partial(func, *args, **kwargs))
 
-async def run_nvidia_smi_in_container(command: list[str]) -> str:
+async def run_nvidia_smi_in_container(command: list[str], pid_mode: "str | None" = None) -> str:
     """Runs an nvidia-smi command in a temporary container and returns the output.
 
     The probe always requests ALL GPUs (count=-1) and the caller filters to the managed set.
     This keeps per-GPU accounting complete regardless of the GATEWAY_GPU_UUID pin (so pools
-    win over the pin), and avoids a single bad configured UUID erroring the whole probe."""
+    win over the pin), and avoids a single bad configured UUID erroring the whole probe.
+
+    pid_mode='host' is REQUIRED for --query-compute-apps: without the host PID namespace,
+    nvidia-smi inside a container cannot enumerate compute processes and returns an empty list
+    (so per-process VRAM attribution silently fails). The memory.total/used queries don't need it."""
     probe_requests = [DeviceRequest(count=-1, capabilities=[['gpu']])]
+    run_kwargs = dict(command=command, remove=True, device_requests=probe_requests)
+    if pid_mode:
+        run_kwargs["pid_mode"] = pid_mode
     try:
         smi_output = await run_in_executor(
             docker_client.containers.run,
             NVIDIA_UTILITY_IMAGE,
-            command=command,
-            remove=True,
-            device_requests=probe_requests
+            **run_kwargs
         )
         return smi_output.decode('utf-8').strip()
     except APIError as e:
@@ -427,7 +432,8 @@ async def get_compute_apps_vram() -> "list[tuple]":
     with `docker top` / container State.Pid. Returns [] when compute-apps is unsupported/empty
     (older drivers, MIG) so the caller falls back to delta measurement."""
     output = await run_nvidia_smi_in_container(
-        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"]
+        ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid,used_memory", "--format=csv,noheader,nounits"],
+        pid_mode="host",  # required so nvidia-smi can enumerate compute processes (see A2 returns nothing)
     )
     rows = []
     for line in output.splitlines():
