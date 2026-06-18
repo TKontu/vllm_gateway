@@ -17,6 +17,9 @@ ALLOWED_CONFIG_KEYS = {
     "max_model_len",
     "tensor_parallel_size",
     "max_num_seqs",  # max concurrent sequences (vLLM --max-num-seqs); bounds KV-cache need in budget mode
+    "kv_reservation_seqs",  # budget mode: # of sequences to RESERVE KV for (default: max_num_seqs).
+                            # Set below max_num_seqs to allow high scheduler concurrency with a smaller
+                            # reserved KV pool (packs better; excess sequences queue/page).
     "quantization",
     "dtype",
     "inactivity_timeout",
@@ -41,6 +44,7 @@ class ModelConfig:
     max_model_len: int
     tensor_parallel_size: int
     max_num_seqs: int
+    kv_reservation_seqs: Optional[int]  # None -> reserve for max_num_seqs (full); else this many
     quantization: Optional[str]
     dtype: str
     inactivity_timeout: int
@@ -79,6 +83,12 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
     if max_num_seqs < 1:
         raise ValueError(f"model '{name}': 'max_num_seqs' must be >= 1, got {max_num_seqs}")
 
+    kv_reservation_seqs = merged["kv_reservation_seqs"]
+    if kv_reservation_seqs is not None:
+        kv_reservation_seqs = _require_int("kv_reservation_seqs", name, kv_reservation_seqs)
+        if kv_reservation_seqs < 1:
+            raise ValueError(f"model '{name}': 'kv_reservation_seqs' must be >= 1 or null, got {kv_reservation_seqs}")
+
     inactivity_timeout = _require_int("inactivity_timeout", name, merged["inactivity_timeout"])
     if inactivity_timeout < 0:
         raise ValueError(f"model '{name}': 'inactivity_timeout' must be >= 0, got {inactivity_timeout}")
@@ -114,6 +124,7 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
         max_model_len=int(max_model_len),
         tensor_parallel_size=int(tensor_parallel_size),
         max_num_seqs=int(max_num_seqs),
+        kv_reservation_seqs=(int(kv_reservation_seqs) if kv_reservation_seqs is not None else None),
         quantization=quantization,
         dtype=dtype,
         inactivity_timeout=int(inactivity_timeout),

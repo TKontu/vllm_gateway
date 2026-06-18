@@ -186,16 +186,19 @@ def kv_cache_mib(max_model_len, max_num_seqs, num_layers, num_kv_heads, head_dim
 
 # Canonical keys of a footprint "signature" — the inputs that determine a model's measured size.
 # A persisted footprint is reused only when its stored signature matches the current request's, so a
-# mode switch or a config change (context length / concurrency / TP / util basis) forces re-measure.
-_SIGNATURE_KEYS = ("mode", "max_model_len", "max_num_seqs", "effective_tp", "util_basis")
+# mode switch or a config change (context length / reserved KV seqs / TP / util basis) forces
+# re-measure. Sizing depends on kv_seqs (reserved sequences), NOT max_num_seqs (scheduler width).
+_SIGNATURE_KEYS = ("mode", "max_model_len", "kv_seqs", "effective_tp", "util_basis")
 
 
-def footprint_signature(mode, max_model_len, max_num_seqs, effective_tp, util_basis=0.0) -> dict:
-    """Build the signature stamped onto a footprint record (and compared on reuse)."""
+def footprint_signature(mode, max_model_len, kv_seqs, effective_tp, util_basis=0.0) -> dict:
+    """Build the signature stamped onto a footprint record (and compared on reuse).
+
+    kv_seqs is the number of sequences KV was reserved for (kv_reservation_seqs, else max_num_seqs)."""
     return {
         "mode": mode,
         "max_model_len": int(max_model_len),
-        "max_num_seqs": int(max_num_seqs),
+        "kv_seqs": int(kv_seqs),
         "effective_tp": int(effective_tp),
         "util_basis": round(float(util_basis), 4),
     }

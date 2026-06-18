@@ -57,7 +57,10 @@ defaults:                      # optional; applied to every model unless overrid
   gpu_memory_utilization: 0.90 # whole_card mode: per-model card share. budget mode: unused for
                                # sizing (GPU_BUDGET_FRACTION is the cap); still the discovery util.
   max_model_len: 0             # 0 = native max (whole_card). budget mode REQUIRES > 0 per model.
-  max_num_seqs: 16             # max concurrent sequences (--max-num-seqs); bounds KV need in budget mode
+  max_num_seqs: 16             # vLLM scheduler width (--max-num-seqs)
+  # kv_reservation_seqs: null  # budget mode: # of sequences to RESERVE KV for. null -> = max_num_seqs.
+                               # Set BELOW max_num_seqs to allow high concurrency for SHORT requests
+                               # while packing tightly (excess sequences queue/page in the reserved pool).
   tensor_parallel_size: 1
   quantization: null           # awq | gptq | fp8 | null
   dtype: auto                  # auto | float16 | bfloat16 | ...
@@ -123,6 +126,32 @@ models:                        # required, non-empty
     pool: llm
     max_model_len: 32768
     max_num_seqs: 8
+
+  # --- High concurrency without hogging the budget (kv_reservation_seqs) ----
+  # Admit up to 32 concurrent requests (scheduler width) but only RESERVE KV for 4 — so this model
+  # packs like a 4-way model yet absorbs bursts of SHORT requests (the extra ones queue/page within
+  # the reserved pool). Ideal for LLM-as-judge / ranking / eval traffic (many short calls).
+  judge-fast:
+    repo: cyankiwi/Qwen3.5-4B-AWQ-4bit
+    pool: llm
+    max_model_len: 8192
+    max_num_seqs: 32
+    kv_reservation_seqs: 4
+
+  # --- Multiple named profiles of the SAME repo ----------------------------
+  # Identity is the config NAME, so you can register one repo twice with different launch profiles
+  # and have the application route to whichever fits the request (short-burst vs long-context).
+  # NOTE: if both are loaded at once the weights sit in VRAM TWICE; otherwise the gateway swaps
+  # between them. Best when you use them in batches rather than interleaved request-by-request.
+  coder-short:
+    repo: Qwen/Qwen2.5-Coder-7B-Instruct
+    max_model_len: 8192
+    max_num_seqs: 16
+    kv_reservation_seqs: 4
+  coder-long:
+    repo: Qwen/Qwen2.5-Coder-7B-Instruct   # same repo, long-context profile
+    max_model_len: 32768
+    max_num_seqs: 1
 
   # A large model forced across both 3090s with tensor parallel. tensor_parallel_size must
   # not exceed the GPUs declared in the pool (validated at startup), and the pool must be
