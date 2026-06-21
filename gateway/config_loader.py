@@ -8,6 +8,7 @@ Resolution precedence per setting:  per-model entry  >  defaults block  >  built
 default (the corresponding existing env var, supplied by the caller as ``builtins``).
 """
 
+import copy
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,6 +28,8 @@ ALLOWED_CONFIG_KEYS = {
     "extra_args",
     "pool",  # name of the GPU pool this model is placed in (multi-GPU); None = default pool
     "colocate",  # if true, may share a GPU with other co-locatable models (Phase 3)
+    "request_defaults",  # mapping merged UNDER each request body before forwarding (caller wins,
+                         # shallow per top-level key). e.g. chat_template_kwargs.enable_thinking=false.
 }
 
 # Per-model entries additionally require/allow "repo".
@@ -52,6 +55,7 @@ class ModelConfig:
     extra_args: list
     pool: Optional[str]  # GPU pool name (multi-GPU placement); None = the default/implicit pool
     colocate: bool  # may share a GPU with other co-locatable models (Phase 3)
+    request_defaults: dict  # request-body defaults merged under the caller's body before forwarding
 
 
 def _require_int(field: str, model: str, value):
@@ -117,6 +121,12 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
     if not isinstance(colocate, bool):
         raise ValueError(f"model '{name}': 'colocate' must be a boolean, got {colocate!r}")
 
+    request_defaults = merged["request_defaults"]
+    if not isinstance(request_defaults, dict):
+        raise ValueError(f"model '{name}': 'request_defaults' must be a mapping, got {request_defaults!r}")
+    if "model" in request_defaults:
+        raise ValueError(f"model '{name}': 'request_defaults' may not set 'model' (the gateway sets it from repo)")
+
     return ModelConfig(
         name=name,
         repo=repo,
@@ -133,7 +143,20 @@ def _construct(name: str, repo: str, merged: dict) -> ModelConfig:
         extra_args=[str(a) for a in extra_args],
         pool=pool.strip() if isinstance(pool, str) else None,
         colocate=colocate,
+        # Deep copy so a shared defaults.request_defaults mapping (and its nested dicts) is
+        # never aliased across models — mutating one model's copy can't leak into another.
+        request_defaults=copy.deepcopy(request_defaults),
     )
+
+
+def merge_request_defaults(defaults: dict, body: dict) -> dict:
+    """Shallow-merge per-model request defaults UNDER the caller's body (caller wins).
+
+    Merge is per top-level key: a key present in ``body`` keeps the caller's whole value;
+    keys only in ``defaults`` are injected. Returns a NEW dict (never mutates either input,
+    since ``body`` is the live request and ``defaults`` is the shared per-model config).
+    """
+    return {**defaults, **body}
 
 
 def resolve_model_configs(raw: dict, builtins: dict) -> "dict[str, ModelConfig]":
