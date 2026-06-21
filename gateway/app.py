@@ -19,7 +19,7 @@ from huggingface_hub import hf_hub_download, list_repo_files, HfApi
 import yaml
 import placement
 from config_loader import (
-    ModelConfig, resolve_model_configs, build_fallback_configs,
+    ModelConfig, resolve_model_configs, build_fallback_configs, merge_request_defaults,
     resolve_pools, validate_model_pools, validate_tp_against_pools, validate_colocate,
     validate_pools_visible, validate_budget_mode, validate_extra_args_budget, migrate_footprints,
 )
@@ -691,6 +691,7 @@ def builtin_model_defaults() -> dict:
         "extra_args": [],
         "pool": None,
         "colocate": False,
+        "request_defaults": {},
     }
 
 def load_model_configs() -> "tuple[dict, dict]":
@@ -1864,6 +1865,10 @@ async def proxy_request(request: Request):
         current_queue_depth = model_queue_counts.get(target_model_id, 0)
 
         try:
+            # Inject per-model request defaults UNDER the caller's body (caller wins). Must run
+            # before body['model'] is set (so repo always wins) and before is_streaming is read.
+            if model_cfg.request_defaults:
+                body = merge_request_defaults(model_cfg.request_defaults, body)
             body['model'] = model_cfg.repo  # vLLM serves under the repo it was launched with (--model)
             headers_to_forward = {
                 k: v for k, v in request.headers.items()

@@ -69,11 +69,25 @@ defaults:                      # optional; applied to every model unless overrid
   extra_args: []               # raw vLLM CLI args, appended verbatim. NOTE: --model,
                                # --gpu-memory-utilization and --tensor-parallel-size are
                                # gateway-managed (set from placement) and ignored here if present.
+  # request_defaults: {}       # mapping merged into each request body before forwarding to vLLM.
+                               # CALLER WINS: only fills keys the request didn't send (true defaults).
+                               # Shallow per top-level key — if the caller sends a key (e.g. its own
+                               # chat_template_kwargs) their whole value replaces the default for it.
+                               # May not set 'model' (gateway-managed). See qwen3-30b below.
 
 models:                        # required, non-empty
   # A small instruct model on its native context length (default pool: llm).
   gemma3-4B:
     repo: google/gemma-3-4b-it
+
+  # A reasoning model with "thinking" hardcoded OFF for every request. The gateway injects
+  # chat_template_kwargs.enable_thinking=false unless the caller sends its own chat_template_kwargs.
+  # (Uses the default pool 'llm'.)
+  qwen3-30b:
+    repo: Qwen/Qwen3-30B-A3B
+    request_defaults:
+      chat_template_kwargs:
+        enable_thinking: false
 
   # An AWQ-quantized model on the LLM pool.
   qwen3-30b-awq:

@@ -12,7 +12,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "gateway"))
 
 from config_loader import (  # noqa: E402
-    resolve_model_configs, build_fallback_configs, resolve_pools,
+    resolve_model_configs, build_fallback_configs, resolve_pools, merge_request_defaults,
     validate_model_pools, validate_tp_against_pools, validate_colocate,
     validate_pools_visible, validate_budget_mode, validate_extra_args_budget, migrate_footprints,
 )
@@ -31,6 +31,7 @@ BUILTINS = {
     "extra_args": [],
     "pool": None,
     "colocate": False,
+    "request_defaults": {},
 }
 
 
@@ -143,7 +144,70 @@ def test_fallback_matches_builtins():
     assert c.tensor_parallel_size == 1
     assert c.inactivity_timeout == 1800
     assert c.always_on is False
+    assert c.request_defaults == {}
     print("ok: fallback configs match builtins")
+
+
+def test_request_defaults_precedence():
+    """per-model request_defaults fully REPLACES defaults block, which replaces builtin {}.
+
+    Precedence across config tiers is whole-value replacement (the existing merged.update
+    semantics) — the shallow/caller merge only applies later, at request time.
+    """
+    raw = {
+        "defaults": {"request_defaults": {"chat_template_kwargs": {"enable_thinking": False}}},
+        "models": {
+            "inherits": {"repo": "o/a"},  # gets the defaults block value
+            "overrides": {"repo": "o/b", "request_defaults": {"temperature": 0}},  # replaces it
+            "none": {"repo": "o/c", "request_defaults": {}},  # explicit empty
+        },
+    }
+    cfgs = resolve_model_configs(raw, BUILTINS)
+    assert cfgs["inherits"].request_defaults == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert cfgs["overrides"].request_defaults == {"temperature": 0}
+    assert cfgs["none"].request_defaults == {}
+    print("ok: request_defaults precedence")
+
+
+def test_request_defaults_isolation():
+    """Each model gets its own deep copy — no shared mutable (incl. nested dicts)."""
+    raw = {
+        "defaults": {"request_defaults": {"chat_template_kwargs": {"enable_thinking": False}}},
+        "models": {"x": {"repo": "o/x"}, "y": {"repo": "o/y"}},
+    }
+    cfgs = resolve_model_configs(raw, BUILTINS)
+    cfgs["x"].request_defaults["chat_template_kwargs"]["enable_thinking"] = True
+    cfgs["x"].request_defaults["added"] = 1
+    assert cfgs["y"].request_defaults == {"chat_template_kwargs": {"enable_thinking": False}}, \
+        "request_defaults leaked across models"
+    assert BUILTINS["request_defaults"] == {}, "builtins request_defaults was mutated"
+    print("ok: request_defaults isolated per model")
+
+
+def test_request_defaults_validation_errors():
+    # must be a mapping
+    _expect_error({"models": {"m": {"repo": "o/r", "request_defaults": "nope"}}}, "request_defaults")
+    # may not set the gateway-managed 'model' key
+    _expect_error({"models": {"m": {"repo": "o/r", "request_defaults": {"model": "x"}}}}, "request_defaults")
+    print("ok: request_defaults validation errors")
+
+
+def test_merge_request_defaults_helper():
+    """Shallow merge, caller wins per top-level key; inputs not mutated; new object."""
+    defaults = {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+    body = {"messages": [], "chat_template_kwargs": {"enable_thinking": True}}
+    merged = merge_request_defaults(defaults, body)
+    # caller wins for a shared key (whole value replaced — documents the shallow tradeoff)
+    assert merged["chat_template_kwargs"] == {"enable_thinking": True}
+    # default-only key is injected
+    assert merged["temperature"] == 0
+    # caller-only key preserved
+    assert merged["messages"] == []
+    # inputs untouched; result is a new object
+    assert defaults == {"chat_template_kwargs": {"enable_thinking": False}, "temperature": 0}
+    assert body == {"messages": [], "chat_template_kwargs": {"enable_thinking": True}}
+    assert merged is not defaults and merged is not body
+    print("ok: merge_request_defaults helper")
 
 
 # --- pools (multi-GPU) ---

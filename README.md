@@ -118,9 +118,15 @@ defaults:                      # optional; applies to all models
   inactivity_timeout: 1800     # seconds; 0 = never unload
   always_on: false
   extra_args: []               # raw vLLM CLI args, appended verbatim
+  request_defaults: {}         # request-body defaults, merged under each request (caller wins)
 models:                        # required, non-empty
   gemma3-4B:
     repo: google/gemma-3-4b-it
+  qwen3-30b:
+    repo: Qwen/Qwen3-30B-A3B
+    request_defaults:          # hardcode "thinking off" for this reasoning model
+      chat_template_kwargs:
+        enable_thinking: false
   qwen3-30b-awq:
     repo: cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
     quantization: awq          # per-model override
@@ -141,6 +147,14 @@ config: always `--model`, `--gpu-memory-utilization`, `--tensor-parallel-size`; 
 string is appended verbatim. `extra_args` override any flag the gateway generated (no
 duplicates). The final command is logged per model.
 
+**Per-model request defaults.** `request_defaults` (a mapping, default `{}`) is merged into each
+inference request body before it is forwarded to vLLM. **Caller-provided fields win** — these are
+defaults, not overrides, so a client can still opt back in by sending its own value. The merge is
+shallow (per top-level key): if the caller sends a key at all (e.g. its own `chat_template_kwargs`),
+their whole value replaces the default for that key. The gateway-managed `model` field may not be
+set here. Typical use: hardcode `chat_template_kwargs: {enable_thinking: false}` to keep a reasoning
+model's "thinking" off by default.
+
 **Lifecycle.** Containers whose model sets `always_on: true` (or `inactivity_timeout: 0`) are
 never auto-unloaded by the inactivity monitor; all others use their own resolved
 `inactivity_timeout`.
@@ -148,7 +162,8 @@ never auto-unloaded by the inactivity monitor; all others use their own resolved
 **Validation / fail-fast.** The file is validated at startup — `models` must be present and
 non-empty, every model needs a non-empty `repo`, unknown keys are rejected, and types/ranges
 are checked (`0 < gpu_memory_utilization <= 1`, integer fields must be integers, `extra_args`
-must be a list). Any error is logged and the gateway refuses to start.
+must be a list, `request_defaults` must be a mapping that doesn't set `model`). Any error is
+logged and the gateway refuses to start.
 
 **Backward compatibility.** If `MODELS_CONFIG_FILE` is missing, the gateway falls back to the
 legacy `ALLOWED_MODELS_JSON` env var with the global `VLLM_*` settings — behaving exactly as
