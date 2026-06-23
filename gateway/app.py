@@ -972,24 +972,39 @@ def _dtype_bytes(torch_dtype) -> int:
         return 1
     return 2
 
-def _sliding_window_spec(cfg_text: dict, num_layers: int) -> "tuple[int, int]":
-    """(sliding_window, num_sliding_layers) for a model, or (0, 0) for full attention.
+# Substrings (in a layer_types entry) for layers whose KV state is FIXED-size and does NOT grow with
+# context — linear / recurrent / SSM (Mamba-style) / gated-delta attention. These cost ~0 KV
+# reservation and must be excluded from the full-attention layer count (Qwen3-Next-style hybrids
+# interleave them, e.g. 3 linear : 1 full).
+_LINEAR_LAYER_KEYS = ("linear", "recurrent", "mamba", "ssm", "gated_delta", "delta_net", "conv")
 
-    Evidence order: explicit per-layer `layer_types` (most accurate) -> Gemma-style
-    `sliding_window` + `sliding_window_pattern` (every Nth layer is global/full) -> a bare
-    `sliding_window` (Mistral convention: all layers sliding)."""
+
+def _attention_layer_spec(cfg_text: dict, num_layers: int) -> "tuple[int, int, int]":
+    """(sliding_window, num_sliding_layers, num_linear_layers) for a model.
+
+    Evidence order: explicit per-layer `layer_types` (most accurate — classifies every layer as
+    sliding / linear / full) -> Gemma-style `sliding_window` + `sliding_window_pattern` -> a bare
+    `sliding_window` (Mistral convention: all layers sliding). `layer_types` is honored even when no
+    `sliding_window` key is present, so a hybrid linear-attention model's linear layers are recognized
+    (otherwise the whole model is mis-counted as full attention -> huge KV over-estimate)."""
     window = cfg_text.get("sliding_window")
-    if not isinstance(window, int) or window <= 0:
-        return 0, 0
+    window = int(window) if isinstance(window, int) and window > 0 else 0
+
     layer_types = cfg_text.get("layer_types")
     if isinstance(layer_types, list) and layer_types:
         n_sliding = sum(1 for t in layer_types if isinstance(t, str) and "sliding" in t.lower())
-        return window, n_sliding
+        n_linear = sum(1 for t in layer_types if isinstance(t, str)
+                       and "sliding" not in t.lower()
+                       and any(k in t.lower() for k in _LINEAR_LAYER_KEYS))
+        return window, n_sliding, n_linear
+
+    if window <= 0:
+        return 0, 0, 0
     pattern = cfg_text.get("sliding_window_pattern")
     if isinstance(pattern, int) and pattern > 1:
         n_global = num_layers // pattern          # every `pattern`-th layer is full/global
-        return window, max(0, num_layers - n_global)
-    return window, num_layers                      # bare sliding_window -> assume all layers sliding
+        return window, max(0, num_layers - n_global), 0
+    return window, num_layers, 0                   # bare sliding_window -> assume all layers sliding
 
 async def get_model_kv_spec(model_id: str, tokenizer_repo: "str | None" = None) -> "dict | None":
     """Fetch the KV-cache-relevant architecture fields from a model's config.json.
@@ -1013,10 +1028,11 @@ async def get_model_kv_spec(model_id: str, tokenizer_repo: "str | None" = None) 
         logging.warning(f"Incomplete KV spec for {model_id}: layers={num_layers}, "
                         f"kv_heads={n_kv}, head_dim={head_dim}; falling back to discovery.")
         return None
-    window, n_sliding = _sliding_window_spec(text, int(num_layers))
+    window, n_sliding, n_linear = _attention_layer_spec(text, int(num_layers))
     return {"num_layers": int(num_layers), "num_kv_heads": int(n_kv),
             "head_dim": int(head_dim), "dtype_bytes": _dtype_bytes(text.get("torch_dtype", "float16")),
-            "sliding_window": int(window), "num_sliding_layers": int(n_sliding)}
+            "sliding_window": int(window), "num_sliding_layers": int(n_sliding),
+            "num_linear_layers": int(n_linear)}
 
 
 def kv_reservation_seqs(model_cfg: ModelConfig) -> int:
@@ -1044,7 +1060,8 @@ async def estimate_model_need_mib(model_id: str, model_cfg: ModelConfig, effecti
         max_model_len=model_cfg.max_model_len, max_num_seqs=kv_reservation_seqs(model_cfg),
         num_layers=spec["num_layers"], num_kv_heads=spec["num_kv_heads"],
         head_dim=spec["head_dim"], dtype_bytes=spec["dtype_bytes"],
-        sliding_window=spec.get("sliding_window", 0), num_sliding_layers=spec.get("num_sliding_layers", 0))
+        sliding_window=spec.get("sliding_window", 0), num_sliding_layers=spec.get("num_sliding_layers", 0),
+        num_linear_layers=spec.get("num_linear_layers", 0))
     weights_mib = wbytes / (1024.0 * 1024.0)
     return placement.estimate_need_mib(weights_mib, kv_total, effective_tp,
                                        BUDGET_OVERHEAD_FACTOR, BUDGET_OVERHEAD_MIB)
@@ -1469,6 +1486,55 @@ def _build_gpu_views(pool_gpus, gpus_snapshot):
             blocked.add(guid)
     return candidates, residents_by_gpu, blocked
 
+
+def _placement_failure_detail(target_model_id, pool, is_colocate, effective_tp,
+                              candidates, residents_by_gpu, need_fn, budget_mode) -> str:
+    """Explain WHY placement failed, with per-GPU need vs free/budget and the likely cause.
+
+    Built only on the 503 (cold) path, so the extra work is negligible. The generic message used to
+    lump several distinct causes together (empty-pool over-budget, model-too-big, eviction-blocked),
+    which made misdiagnosis easy; this distinguishes them and prints the numbers."""
+    def need_for(g):
+        return float(need_fn(g) if callable(need_fn) else need_fn)
+
+    rows = []
+    any_evictable = False        # some candidate has a resident we're allowed to evict
+    fits_a_card = False          # the need fits at least one card's physical total
+    for g in candidates:
+        need = need_for(g)
+        residents = residents_by_gpu.get(g.uuid, [])
+        any_evictable = any_evictable or any(
+            (not r.always_on and r.active_requests == 0) for r in residents)
+        fits_a_card = fits_a_card or (need <= g.total)
+        held = [f"{r.container_name}"
+                + (" always_on" if r.always_on else "")
+                + (f" in-flight={r.active_requests}" if r.active_requests else "")
+                for r in residents]
+        cap = f", budget={g.budget:.0f}" if (budget_mode and math.isfinite(g.budget)) else ""
+        rows.append(f"{g.uuid}: need={need:.0f} MiB, free={g.free:.0f}, total={g.total:.0f}{cap}"
+                    + (", residents=[" + ", ".join(held) + "]" if held else ", empty"))
+
+    budget_hint = ("lower kv_reservation_seqs/max_num_seqs/max_model_len, raise GPU_BUDGET_FRACTION, "
+                   "or set tensor_parallel_size>1")
+    if not fits_a_card:
+        cause = ("estimated need exceeds a single card even when EMPTY"
+                 + (f"; in budget mode the need is weights + KV for max_model_len × "
+                    f"kv_reservation_seqs — {budget_hint}" if budget_mode else
+                    "; the model is too large for one card — set tensor_parallel_size>1"))
+    elif any_evictable:
+        cause = ("would fit after eviction, but the candidate GPU(s) are held by always_on or "
+                 "in-flight residents that cannot be evicted")
+    elif budget_mode:
+        cause = (f"fits physically but exceeds the per-card budget (GPU_BUDGET_FRACTION × total) — {budget_hint}")
+    else:
+        cause = ("no candidate GPU can host it — pool may be non-homogeneous, or have too few GPUs "
+                 f"for tensor_parallel_size={effective_tp}")
+
+    desc = "colocate" if is_colocate else f"tp={effective_tp}"
+    return (f"Cannot place model {target_model_id} in pool '{pool}' ({desc}): {cause}. "
+            f"Per-GPU: " + " | ".join(rows))
+
+
 async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, effective_tp,
                               effective_util, run_discovery, before_used, meas_gpu,
                               signature=None):
@@ -1672,11 +1738,11 @@ async def _ensure_started(target_model_id, model_cfg):
             chosen_uuids, evictions = placement.select_placement(
                 candidates, residents_by_gpu, need_fn, effective_tp, time.time(), GATEWAY_MIN_RESIDENT_SECONDS)
         if chosen_uuids is None:
-            raise HTTPException(
-                status_code=503,
-                detail=(f"Cannot place model {target_model_id} in pool '{pool}' "
-                        f"({'colocate' if is_colocate else f'tp={effective_tp}'}): no GPU available without "
-                        f"evicting always_on/in-flight models (or pool not homogeneous / too few GPUs for TP)."))
+            detail = _placement_failure_detail(
+                target_model_id, pool, is_colocate, effective_tp,
+                candidates, residents_by_gpu, need_fn, budget_mode)
+            logging.warning(detail)
+            raise HTTPException(status_code=503, detail=detail)
 
         chosen_gv = next(c for c in candidates if c.uuid == chosen_uuids[0])
         if is_colocate:
