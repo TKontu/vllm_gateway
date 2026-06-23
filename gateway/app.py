@@ -1603,9 +1603,15 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
                 measured = delta if delta > 256 else None
                 source = "gpu-delta"
             # 3) Last resort: keep the reserved estimate (already seeded into vram_footprint).
+            # vram_footprint / per_gpu_mib are PER-GPU (counted on each of the model's cards in
+            # _build_gpu_views). compute-apps SUMS usage across all the model's GPUs, so for a
+            # tensor-parallel model `measured` is the cross-card TOTAL -> divide by the TP degree to get
+            # the per-card share (weights+KV shard ~evenly across ranks). The gpu-delta path already
+            # samples a single card, and the reserved-estimate fallback is already per-card.
             if measured is not None and measured > 256:
-                entry.vram_footprint = measured
-                footprint_mib = measured
+                per_gpu_mib = (measured / max(1, effective_tp)) if source == "compute-apps" else measured
+                entry.vram_footprint = per_gpu_mib
+                footprint_mib = per_gpu_mib
             else:
                 footprint_mib = entry.reserved_mib
                 source = (source or "") + "/estimate-fallback"
@@ -1614,7 +1620,8 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
                 "effective_util": float(effective_util or 0.0), "measured_at": time.time(),
                 "signature": signature}
             await save_known_footprints_async()
-            logging.info(f"Footprint for {target_model_id}: {int(footprint_mib)} MiB (via {source}).")
+            logging.info(f"Footprint for {target_model_id}: {int(footprint_mib)} MiB/GPU "
+                         f"(tp={effective_tp}, via {source}).")
         return entry
     finally:
         loading_tasks.pop(entry.container_name, None)  # release owner-liveness handle on every exit
