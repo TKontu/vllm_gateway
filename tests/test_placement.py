@@ -395,6 +395,25 @@ def test_kv_cache_mib_sliding_window():
     assert abs(kv_cache_mib(1000, 1, 1, 1, 1, 2) - (2 * 1000 * 2) / (1024.0 * 1024.0)) < 1e-9
 
 
+def test_kv_cache_mib_linear_layers():
+    # Qwen3-Next-style hybrid: 64 layers, 48 linear (no context-scaling KV) + 16 full attention.
+    all_full = kv_cache_mib(262144, 1, 64, 4, 256, 2)
+    hybrid = kv_cache_mib(262144, 1, 64, 4, 256, 2, num_linear_layers=48)
+    # Only 16 of 64 layers bear KV -> exactly a quarter of the all-full estimate.
+    assert abs(hybrid - all_full * (16.0 / 64.0)) < 1e-6, (hybrid, all_full)
+    # Equivalent to a model that simply has 16 full layers.
+    assert abs(hybrid - kv_cache_mib(262144, 1, 16, 4, 256, 2)) < 1e-6
+    # num_linear_layers=0 (default) is the legacy all-full behavior.
+    assert kv_cache_mib(8192, 16, 32, 8, 128, 2, num_linear_layers=0) \
+        == kv_cache_mib(8192, 16, 32, 8, 128, 2)
+    # Linear + sliding coexist: full = total - sliding - linear, clamped at >= 0.
+    mixed = kv_cache_mib(32768, 4, 64, 4, 256, 2, sliding_window=1024, num_sliding_layers=16,
+                         num_linear_layers=48)
+    assert mixed == kv_cache_mib(32768, 4, 64, 4, 256, 2, sliding_window=1024, num_sliding_layers=16,
+                                 num_linear_layers=48)
+    assert mixed > 0  # 0 full + 16 sliding + 48 linear -> sliding-only cost, still positive
+
+
 def test_attribute_vram():
     rows = [("GPU-a", 111, 8000.0), ("GPU-a", 222, 1200.0),
             ("GPU-b", 333, 5000.0), ("GPU-a", 999, 4000.0)]  # 999 is a foreign process

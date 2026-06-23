@@ -158,26 +158,32 @@ def minimal_tp_to_fit(weight_bytes, card_total_mib, util, overhead=1.2, pool_siz
 
 
 def kv_cache_mib(max_model_len, max_num_seqs, num_layers, num_kv_heads, head_dim, dtype_bytes,
-                 sliding_window=0, num_sliding_layers=0) -> float:
+                 sliding_window=0, num_sliding_layers=0, num_linear_layers=0) -> float:
     """Estimated TOTAL KV-cache size (MiB) for a model held resident at the given context/concurrency.
 
     Per (full-attention) layer a sequence needs `max_model_len` tokens of KV; a sliding-window layer
-    only needs `min(sliding_window, max_model_len)` (Gemma 3, Mistral interleave these). So:
+    only needs `min(sliding_window, max_model_len)` (Gemma 3, Mistral interleave these). A LINEAR /
+    recurrent / SSM (Mamba-style) layer keeps a fixed-size state that does NOT grow with context, so it
+    contributes ~0 to the KV reservation — `num_linear_layers` of them are excluded from the full count
+    (Qwen3-Next-style hybrids interleave 3 linear : 1 full). So:
+        full_layers = num_layers - sliding_layers - linear_layers
         token-layers/seq = full_layers * L + sliding_layers * min(window, L)        (L = max_model_len)
         KV bytes = 2 (key+value) * num_kv_heads * head_dim * dtype_bytes * token-layers/seq * seqs
-    With `sliding_window<=0` or `num_sliding_layers<=0` every layer is full (legacy behavior). This is
-    the whole-model KV; under tensor parallel the caller divides by tp. Returns 0.0 if any core input
-    is non-positive (unknown -> caller falls back to discovery).
+    With `sliding_window<=0` or `num_sliding_layers<=0` no layer is sliding; with `num_linear_layers=0`
+    none is linear (legacy behavior — every layer full). This is the whole-model KV; under tensor
+    parallel the caller divides by tp. Returns 0.0 if any core input is non-positive (unknown ->
+    caller falls back to discovery).
     """
     vals = (max_model_len, max_num_seqs, num_layers, num_kv_heads, head_dim, dtype_bytes)
     if any((v is None or v <= 0) for v in vals):
         return 0.0
     if sliding_window and sliding_window > 0 and num_sliding_layers and num_sliding_layers > 0:
         sliding = min(int(num_sliding_layers), int(num_layers))
-        full = int(num_layers) - sliding
         eff_sliding_len = min(int(sliding_window), int(max_model_len))
     else:
-        full, sliding, eff_sliding_len = int(num_layers), 0, 0
+        sliding, eff_sliding_len = 0, 0
+    linear = max(0, min(int(num_linear_layers), int(num_layers) - sliding))
+    full = max(0, int(num_layers) - sliding - linear)
     token_layers_per_seq = full * int(max_model_len) + sliding * eff_sliding_len
     total_bytes = 2 * int(num_kv_heads) * int(head_dim) * int(dtype_bytes) \
         * token_layers_per_seq * int(max_num_seqs)
