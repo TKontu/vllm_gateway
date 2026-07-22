@@ -174,10 +174,16 @@ active_containers = {}  # container_name -> ContainerState (entries exist while 
 # One lock guards ALL of active_containers: membership, status transitions, slot allocation, and the
 # VRAM accounting derived from it (reservations now live ON the entries, not in a side dict). It is
 # held ONLY for in-memory decisions/mutations — NEVER across a container start, get_gpu_vram, or
-# stop_container. Acquire order: container_start_locks[model] -> state_lock.
+# stop_container. Acquire order: container_start_locks[model] -> gpu_startup_locks[...] -> state_lock.
 state_lock = asyncio.Lock()
 container_start_locks = {}  # model_id -> asyncio.Lock for preventing concurrent container starts
 download_locks = {}  # model_id -> asyncio.Lock for preventing concurrent downloads
+# gpu_uuid -> asyncio.Lock serializing vLLM engine startup across containers that SHARE a card. vLLM's
+# memory-profiling step measures whole-device free VRAM; a neighbor allocating/freeing on the same card
+# mid-profile corrupts it (worker dies with "Error in memory profiling"). Held for the whole start->READY
+# window; models on disjoint GPUs never contend. Taken in sorted-UUID order so overlapping sets can't
+# deadlock. Acquire order: container_start_locks[model] -> gpu_startup_locks[...] -> state_lock.
+gpu_startup_locks = {}
 # container_name -> the asyncio.Task currently starting that LOADING entry. The reconciler reaps a
 # LOADING entry only when its owner task is absent/done (a true orphan), never on a timer — so a
 # legitimately slow start (large download) is never killed. Kept off ContainerState so /status stays
@@ -823,17 +829,24 @@ async def stop_container(container_name: str, drain_timeout: float = 30.0):
         if state.active_requests > 0:
             logging.warning(f"Container {container_name} still had {state.active_requests} active request(s) after drain timeout; force stopping.")
 
-    # Step 3: stop and remove the Docker container.
+    # Step 3: stop and remove the Docker container. Hold this container's per-GPU startup gate across
+    # the stop/remove: freeing VRAM on a card while a vLLM engine is profiling on that same card
+    # corrupts the neighbor's memory measurement (free memory jumps mid-profile -> "Error in memory
+    # profiling"). The gate makes the free wait until any co-resident load on those cards is READY.
+    # The container stays RUNNING (VRAM still used, still counted while STOPPING) during that wait, so
+    # accounting stays accurate. gpu_uuids is empty for untracked containers -> the gate is a no-op.
     try:
-        container = await run_in_executor(docker_client.containers.get, container_name)
-        logging.info(f"Stopping container {container_name}...")
-        await run_in_executor(container.stop)
-        await run_in_executor(container.remove)
-        logging.info(f"Container {container_name} stopped and removed.")
-    except NotFound:
-        logging.warning(f"Attempted to stop container {container_name}, but it was not found.")
-    except APIError as e:
-        logging.error(f"Error stopping or removing container {container_name}: {e}")
+        async with _gpu_startup_gate(state.gpu_uuids if state else None):
+            try:
+                container = await run_in_executor(docker_client.containers.get, container_name)
+                logging.info(f"Stopping container {container_name}...")
+                await run_in_executor(container.stop)
+                await run_in_executor(container.remove)
+                logging.info(f"Container {container_name} stopped and removed.")
+            except NotFound:
+                logging.warning(f"Attempted to stop container {container_name}, but it was not found.")
+            except APIError as e:
+                logging.error(f"Error stopping or removing container {container_name}: {e}")
     finally:
         # Step 4: drop the entry (single removal site for a STOPPING entry).
         async with state_lock:
@@ -1360,7 +1373,14 @@ async def start_model_container(model_id: str, container_name: str, model_cfg: M
         elapsed_time = 1800 * 2
         elapsed_min = elapsed_time // 60
         logging.error(f"Model {model_id} failed to start after {elapsed_min}m timeout.")
-        await stop_container(container_name)
+        # Raw removal, NOT stop_container: we are inside the caller's per-GPU startup gate and
+        # stop_container acquires that same gate -> calling it here would self-deadlock. The
+        # container never reached READY (no in-flight requests to drain), so a force-remove is
+        # sufficient; the caller (_start_and_finalize) drops the LOADING entry on the None return.
+        try:
+            await run_in_executor(new_container.remove, force=True)
+        except (NotFound, APIError) as e:
+            logging.warning(f"Could not remove {container_name} after startup timeout: {e}")
         return None
 
     except APIError as e:
@@ -1535,6 +1555,34 @@ def _placement_failure_detail(target_model_id, pool, is_colocate, effective_tp,
             f"Per-GPU: " + " | ".join(rows))
 
 
+@asynccontextmanager
+async def _gpu_startup_gate(gpu_uuids):
+    """Serialize vLLM engine startup across containers that share any GPU.
+
+    vLLM profiles available VRAM by measuring the WHOLE device's free memory before/after loading
+    weights (determine_available_memory). If a neighbor on the same card allocates or frees VRAM while
+    that profile runs, the measurement is corrupted and the worker dies with "Error in memory profiling"
+    (free memory moving the wrong way). Holding one lock per GPU for the entire start->READY window
+    guarantees only one engine initializes per card at a time; by the time /health passes the model's
+    footprint is stable, so the next container profiles against a settled landscape. Models on disjoint
+    GPUs take disjoint locks and still start concurrently. Locks are acquired in sorted-UUID order so
+    two models with overlapping (but unequal) GPU sets can never deadlock."""
+    ordered = sorted({u for u in (gpu_uuids or []) if u})
+    if not ordered:
+        yield
+        return
+    async with state_lock:
+        locks = [gpu_startup_locks.setdefault(u, asyncio.Lock()) for u in ordered]
+    acquired = []
+    try:
+        for lk in locks:
+            await lk.acquire()
+            acquired.append(lk)
+        yield
+    finally:
+        for lk in reversed(acquired):
+            lk.release()
+
 async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, effective_tp,
                               effective_util, run_discovery, before_used, meas_gpu,
                               signature=None):
@@ -1549,9 +1597,13 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
     sizing context. `signature=None` (degraded mode) skips measurement + persistence."""
     try:
         try:
-            runtime = await start_model_container(
-                model_cfg.repo, entry.container_name, model_cfg,
-                gpu_uuids=gpu_uuids, effective_tp=effective_tp, effective_util=effective_util)
+            # Serialize the engine-init window against any peer sharing these GPUs (see _gpu_startup_gate):
+            # concurrent memory profiling on a shared card is what kills the worker with "Error in memory
+            # profiling". Released as soon as this model is READY so a peer can then profile safely.
+            async with _gpu_startup_gate(gpu_uuids or entry.gpu_uuids):
+                runtime = await start_model_container(
+                    model_cfg.repo, entry.container_name, model_cfg,
+                    gpu_uuids=gpu_uuids, effective_tp=effective_tp, effective_util=effective_util)
         except BaseException:
             async with state_lock:
                 active_containers.pop(entry.container_name, None)  # drop LOADING on any failure/cancel
@@ -1579,10 +1631,13 @@ async def _start_and_finalize(entry, target_model_id, model_cfg, *, gpu_uuids, e
         if stale:
             logging.warning(f"LOADING entry {entry.container_name} disappeared during start "
                             f"(reaped/evicted); stopping the orphaned container.")
+            # Gate this free too: it runs AFTER our start gate released, so a peer could already be
+            # profiling on these cards. entry.gpu_uuids is still valid on the popped entry object.
             try:
-                c = await run_in_executor(docker_client.containers.get, entry.container_name)
-                await run_in_executor(c.stop)
-                await run_in_executor(c.remove)
+                async with _gpu_startup_gate(entry.gpu_uuids):
+                    c = await run_in_executor(docker_client.containers.get, entry.container_name)
+                    await run_in_executor(c.stop)
+                    await run_in_executor(c.remove)
             except (NotFound, APIError) as e:
                 logging.error(f"Could not clean up orphaned container {entry.container_name}: {e}")
             return None
